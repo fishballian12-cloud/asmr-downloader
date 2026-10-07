@@ -8,6 +8,7 @@ ASMR 作品下载命令行工具。根据 ASMR 作品地址或 RJ 号，自动�
 - 调用 `https://api.asmr-200.com/api/workInfo/{rj_number}?v2` 获取作品元数据（title 等）
 - 调用 `https://api.asmr-200.com/api/tracks/{rj_number}?v=2` 获取文件树，按 `children` 递归保持原始目录结构
 - 输出目录命名规则：`RJ号_标题`（如 `RJ01310099_【简体中文版】…`），自动替换 Windows 文件名非法字符
+- 未指定 `-o` 时自动下载到系统下载目录（Windows 通过系统 API 解析真实 Download 路径）
 - 文件类型过滤：
   - `--types` 按 type 字段过滤（text / audio / image / other）
   - `--ext` 按扩展名过滤（如 `mp3,wav`）
@@ -25,7 +26,10 @@ ASMR 作品下载命令行工具。根据 ASMR 作品地址或 RJ 号，自动�
 ## 使用说明
 
 ```bash
-# 基本用法：下载整个作品
+# 不指定输出目录：自动下载到系统下载目录（如 C:\Users\<用户名>\Downloads）
+python asmr_downloader.py "https://asmr.one/work/RJ01310099?path=%5B%5D#work-tree"
+
+# 指定输出目录：下载整个作品到 D:/Downloads
 python asmr_downloader.py "https://asmr.one/work/RJ01310099?path=%5B%5D#work-tree" --output D:/Downloads
 
 # 或直接使用 RJ 号
@@ -52,7 +56,7 @@ python asmr_downloader.py RJ01310099 --workers 4 --retries 5 --output D:/Downloa
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
 | `input` | ASMR 作品地址或 RJ 号（位置参数） | 必填 |
-| `-o, --output` | 下载输出目录，作品会创建在该目录下 | `downloads` |
+| `-o, --output` | 下载输出目录，作品会创建在该目录下；不指定时自动使用系统下载目录 | 系统下载目录 |
 | `--types` | 按 type 字段过滤，逗号分隔：`text,audio,image,other` | 不过滤 |
 | `--ext` | 按扩展名过滤，逗号分隔，如 `mp3,wav` | 不过滤 |
 | `--exclude-ext` | 排除扩展名，逗号分隔，如 `mp4,zip` | 不过滤 |

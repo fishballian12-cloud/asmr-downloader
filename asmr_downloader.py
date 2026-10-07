@@ -13,6 +13,7 @@ ASMR 作品下载器命令行工具。
 
 import argparse
 import json
+import os
 import re
 import sys
 import threading
@@ -77,6 +78,51 @@ def sanitize_filename(name: str) -> str:
     if base in RESERVED_NAMES:
         name = "_" + name
     return name or "_"
+
+
+def get_download_dir() -> str:
+    """解析系统标准下载目录的真实路径。
+
+    Windows 通过 SHGetKnownFolderPath（FOLDERID_Downloads）读取真实下载目录，
+    避免硬编码；其他平台或解析失败时回退到 ~/Downloads。
+    """
+    if os.name == "nt":
+        try:
+            import ctypes
+            import uuid
+            from ctypes import wintypes
+
+            class _GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", wintypes.DWORD),
+                    ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_byte * 8),
+                ]
+
+            folder = _GUID()
+            u = uuid.UUID("{374DE290-123F-4565-9164-39C4925E467B}")  # FOLDERID_Downloads
+            folder.Data1 = u.time_low
+            folder.Data2 = u.time_mid
+            folder.Data3 = u.time_hi_version
+            folder.Data4 = (ctypes.c_byte * 8).from_buffer_copy(u.bytes[8:])
+
+            fn = ctypes.windll.shell32.SHGetKnownFolderPath
+            fn.argtypes = [
+                ctypes.POINTER(_GUID),
+                wintypes.DWORD,
+                wintypes.HANDLE,
+                ctypes.POINTER(ctypes.c_wchar_p),
+            ]
+            fn.restype = ctypes.c_long
+            path_ptr = ctypes.c_wchar_p()
+            if fn(ctypes.byref(folder), 0, None, ctypes.byref(path_ptr)) == 0 and path_ptr.value:
+                path = path_ptr.value
+                ctypes.windll.ole32.CoTaskMemFree(path_ptr)
+                return path
+        except Exception:  # noqa: BLE001
+            pass
+    return str(Path.home() / "Downloads")
 
 
 def fetch_work_info(rj_number: str):
@@ -222,7 +268,7 @@ def main() -> int:
         description="ASMR 作品下载器：根据 RJ 号获取元数据与文件树并并发下载。",
     )
     parser.add_argument("input", help="ASMR 作品地址（如 https://asmr.one/work/RJ01310099）或 RJ 号（RJ01310099）")
-    parser.add_argument("-o", "--output", default="downloads", help="下载输出目录（默认 downloads）")
+    parser.add_argument("-o", "--output", default=None, help="下载输出目录（不指定则自动使用系统下载目录）")
     parser.add_argument("--types", default="", help="按 type 字段过滤，逗号分隔：text/audio/image/other")
     parser.add_argument("--ext", default="", help="按扩展名过滤，逗号分隔，如 mp3,wav")
     parser.add_argument("--exclude-ext", default="", help="排除扩展名，逗号分隔，如 mp4,zip")
@@ -242,7 +288,10 @@ def main() -> int:
     work_info, rj_used = fetch_work_info(rj_digits)
     title = extract_title(work_info)
     folder_name = sanitize_filename(f"RJ{rj_digits}_{title}")
-    out_dir = Path(args.output) / folder_name
+    output_base = args.output if args.output else get_download_dir()
+    if not args.output:
+        log(f"      未指定 -o，自动使用系统下载目录: {output_base}")
+    out_dir = Path(output_base) / folder_name
     out_dir.mkdir(parents=True, exist_ok=True)
     log(f"[2/4] 作品: {title}")
     log(f"      输出目录: {out_dir}")
