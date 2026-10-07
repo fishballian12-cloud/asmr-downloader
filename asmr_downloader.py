@@ -80,49 +80,12 @@ def sanitize_filename(name: str) -> str:
     return name or "_"
 
 
-def get_download_dir() -> str:
-    """解析系统标准下载目录的真实路径。
+def get_default_output_dir() -> str:
+    """默认下载目录：脚本执行时所在目录（进程当前工作目录）下的 download 子目录。
 
-    Windows 通过 SHGetKnownFolderPath（FOLDERID_Downloads）读取真实下载目录，
-    避免硬编码；其他平台或解析失败时回退到 ~/Downloads。
+    目录在下载前由 main 自动创建。
     """
-    if os.name == "nt":
-        try:
-            import ctypes
-            import uuid
-            from ctypes import wintypes
-
-            class _GUID(ctypes.Structure):
-                _fields_ = [
-                    ("Data1", wintypes.DWORD),
-                    ("Data2", wintypes.WORD),
-                    ("Data3", wintypes.WORD),
-                    ("Data4", ctypes.c_byte * 8),
-                ]
-
-            folder = _GUID()
-            u = uuid.UUID("{374DE290-123F-4565-9164-39C4925E467B}")  # FOLDERID_Downloads
-            folder.Data1 = u.time_low
-            folder.Data2 = u.time_mid
-            folder.Data3 = u.time_hi_version
-            folder.Data4 = (ctypes.c_byte * 8).from_buffer_copy(u.bytes[8:])
-
-            fn = ctypes.windll.shell32.SHGetKnownFolderPath
-            fn.argtypes = [
-                ctypes.POINTER(_GUID),
-                wintypes.DWORD,
-                wintypes.HANDLE,
-                ctypes.POINTER(ctypes.c_wchar_p),
-            ]
-            fn.restype = ctypes.c_long
-            path_ptr = ctypes.c_wchar_p()
-            if fn(ctypes.byref(folder), 0, None, ctypes.byref(path_ptr)) == 0 and path_ptr.value:
-                path = path_ptr.value
-                ctypes.windll.ole32.CoTaskMemFree(path_ptr)
-                return path
-        except Exception:  # noqa: BLE001
-            pass
-    return str(Path.home() / "Downloads")
+    return str(Path(os.getcwd()) / "download")
 
 
 def fetch_work_info(rj_number: str):
@@ -288,9 +251,10 @@ def main() -> int:
     work_info, rj_used = fetch_work_info(rj_digits)
     title = extract_title(work_info)
     folder_name = sanitize_filename(f"RJ{rj_digits}_{title}")
-    output_base = args.output if args.output else get_download_dir()
+    output_base = args.output if args.output else get_default_output_dir()
     if not args.output:
-        log(f"      未指定 -o，自动使用系统下载目录: {output_base}")
+        log(f"      未指定 -o，默认下载到当前目录下的 download 子目录: {output_base}")
+        Path(output_base).mkdir(parents=True, exist_ok=True)
     out_dir = Path(output_base) / folder_name
     out_dir.mkdir(parents=True, exist_ok=True)
     log(f"[2/4] 作品: {title}")

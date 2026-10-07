@@ -3,7 +3,8 @@ __pycache__/
 *.pyc
 *.pyo
 
-# 下载产物目录（自定义 -o 输出）
+# 下载产物目录（默认 download/ 与自定义 downloads/）
+download/
 downloads/
 *.part
 
