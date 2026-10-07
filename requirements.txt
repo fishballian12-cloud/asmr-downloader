@@ -1,0 +1,4 @@
+# ASMR 下载器依赖说明
+# 本项目仅使用 Python 标准库（urllib / json / threading / concurrent.futures），
+# 无需安装任何第三方包（不需要 numpy、requests）。
+# 如需在 Python 3.8 以下环境运行，请自行升级 Python。

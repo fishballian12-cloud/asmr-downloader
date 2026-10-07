@@ -1,0 +1,16 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 下载产物目录
+downloads/
+*.part
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 日志
+*.log
