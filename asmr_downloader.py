@@ -29,10 +29,17 @@ DEFAULT_WORKERS = 8
 DEFAULT_RETRIES = 5
 CONNECT_TIMEOUT = 30
 CHUNK_SIZE = 256 * 1024
+MAX_ACTIVE_CHUNKS = 16
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) asmr-downloader/1.0"
 
 _print_lock = threading.Lock()
 _state_lock = threading.Lock()
+_chunk_semaphore = threading.BoundedSemaphore(MAX_ACTIVE_CHUNKS)
+
+# 全局 opener（--proxy 配置后生效）；None 表示使用系统默认（系统代理/直连）
+_global_opener = None
+# Range 支持探测缓存（按 host）
+_range_support_cache = {}
 
 # Windows 文件名非法字符（含控制字符）
 INVALID_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
@@ -50,10 +57,40 @@ def log(msg: str) -> None:
         print(msg, flush=True)
 
 
+def setup_network(proxy: str = "") -> None:
+    """根据 --proxy 配置全局 opener；未指定代理时保持系统代理/直连默认行为。
+
+    仅支持 http:// 与 https:// 代理；SOCKS 代理（socks5:// 等）不受支持，忽略并警告。
+    """
+    global _global_opener
+    if not proxy:
+        _global_opener = None
+        return
+    m = re.match(r"^(?P<scheme>[a-z][a-z0-9+.-]*)://", proxy.strip())
+    scheme = m.group("scheme").lower() if m else ""
+    if scheme in ("socks", "socks4", "socks5"):
+        log("[代理] 警告: 不支持 SOCKS 代理，忽略 --proxy，使用系统默认网络")
+        _global_opener = None
+        return
+    if scheme not in ("http", "https"):
+        raise ValueError(f"不支持的代理协议: {proxy}（仅支持 http:// 或 https://）")
+    _global_opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    log(f"[代理] 已启用代理: {proxy}")
+
+
+def _open_url(req, timeout: int):
+    """打开请求：已配置代理时走全局 opener，否则用默认 urlopen（系统代理/直连）。"""
+    if _global_opener is not None:
+        return _global_opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
 def http_get_json(url: str, timeout: int = 30) -> object:
     """GET 请求并解析 JSON。"""
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _open_url(req, timeout=timeout) as resp:
         body = resp.read().decode("utf-8")
     return json.loads(body)
 
@@ -173,6 +210,66 @@ def filter_leaf(node: dict, types, exts, exclude_exts) -> bool:
     return True
 
 
+def probe_range_support(url: str) -> bool:
+    """探测服务器是否支持 HTTP Range：用 Range: bytes=0-0 试探，206 即支持。按 host 缓存。"""
+    host = urllib.parse.urlparse(url).netloc
+    if host in _range_support_cache:
+        return _range_support_cache[host]
+    supported = False
+    try:
+        req = urllib.request.Request(
+            quote_url(url), headers={"User-Agent": UA, "Range": "bytes=0-0"}
+        )
+        with _open_url(req, timeout=CONNECT_TIMEOUT) as resp:
+            if resp.getcode() == 206:
+                supported = True
+            elif resp.headers.get("Accept-Ranges", "").lower() == "bytes":
+                supported = True
+    except Exception:  # noqa: BLE001
+        supported = False
+    _range_support_cache[host] = supported
+    return supported
+
+
+def plan_chunks(total_size: int) -> list:
+    """按文件大小规划分片：<5MB 1 片；5~50MB 4 片；>50MB 8 片。返回 [(start, end), ...]。"""
+    MB = 1024 * 1024
+    if total_size < 5 * MB:
+        n = 1
+    elif total_size <= 50 * MB:
+        n = 4
+    else:
+        n = 8
+    if n <= 1:
+        return [(0, total_size - 1)]
+    base = total_size // n
+    chunks = []
+    start = 0
+    for i in range(n):
+        end = total_size - 1 if i == n - 1 else start + base - 1
+        chunks.append((start, end))
+        start = end + 1
+    return chunks
+
+
+def load_chunk_meta(meta_path: Path):
+    """读取分片状态 meta；缺失或结构不合法返回 None。"""
+    try:
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("chunks"), list):
+            return data
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def save_chunk_meta(meta_path: Path, data: dict) -> None:
+    """持久化分片状态 meta（.part.meta.json）。"""
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False)
+
+
 def read_timeout_for_size(expected_size: int) -> int:
     """按文件大小分级计算读超时（秒），避免大文件固定短超时误判。
 
@@ -202,9 +299,22 @@ def _set_read_timeout(resp, timeout: int) -> None:
 
 
 def download_file(url: str, dest: Path, expected_size: int, retries: int) -> bool:
-    """下载单个文件：先写 .part，成功后原子改名；连接/读超时独立兜底重试。"""
+    """下载单个文件：支持 Range 时走分片断点续传，否则退化整文件流式下载。"""
     part_path = dest.with_name(dest.name + ".part")
+    meta_path = dest.with_name(dest.name + ".part.meta.json")
     read_timeout = read_timeout_for_size(expected_size)
+    if expected_size > 0 and probe_range_support(url):
+        log(f"    [Range] {dest.name}: 分片下载（{len(plan_chunks(expected_size))} 片）")
+        return download_file_range(url, part_path, meta_path, dest, expected_size, retries, read_timeout)
+    if meta_path.exists():
+        # 服务器不支持 Range：清理可能残留的分片 meta，走整文件下载
+        meta_path.unlink()
+    log(f"    [整文件] {dest.name}: 服务器不支持 Range，流式下载")
+    return download_file_whole(url, part_path, dest, expected_size, retries, read_timeout)
+
+
+def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: int, retries: int, read_timeout: int) -> bool:
+    """整文件流式下载（Range 退化路径）：先写 .part，成功后原子改名；连接/读超时独立兜底重试。"""
     for attempt in range(1, retries + 1):
         try:
             if part_path.exists():
@@ -213,7 +323,7 @@ def download_file(url: str, dest: Path, expected_size: int, retries: int) -> boo
                 quote_url(url), headers={"User-Agent": UA}
             )
             # 连接阶段独立短超时；连接成功后按文件大小调整读超时
-            with urllib.request.urlopen(req, timeout=CONNECT_TIMEOUT) as resp:
+            with _open_url(req, timeout=CONNECT_TIMEOUT) as resp:
                 _set_read_timeout(resp, read_timeout)
                 with open(part_path, "wb") as fh:
                     while True:
@@ -238,6 +348,108 @@ def download_file(url: str, dest: Path, expected_size: int, retries: int) -> boo
             if attempt < retries:
                 time.sleep(1.5 * attempt)
     return False
+
+
+def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout: int, retries: int) -> bool:
+    """用 Range 下载一个分片到 .part 对应偏移；分片内部重试，耗尽后返回 False。
+
+    受全局信号量约束，控制总活跃分片数，避免与文件级并发叠加导致连接爆炸。
+    """
+    with _chunk_semaphore:
+        for attempt in range(1, retries + 1):
+            try:
+                req = urllib.request.Request(
+                    quote_url(url),
+                    headers={"User-Agent": UA, "Range": f"bytes={start}-{end}"},
+                )
+                with _open_url(req, timeout=CONNECT_TIMEOUT) as resp:
+                    if resp.getcode() != 206:
+                        raise IOError(f"服务器忽略 Range（HTTP {resp.getcode()}）")
+                    _set_read_timeout(resp, read_timeout)
+                    rstart = start
+                    cr = resp.headers.get("Content-Range", "")
+                    m = re.match(r"bytes\s+(\d+)-(\d+)/", cr)
+                    if m:
+                        rstart = int(m.group(1))
+                    if rstart != start:
+                        raise IOError(f"Range 响应偏移不符: 请求 {start}, 响应 {rstart}")
+                    with open(part_path, "r+b") as fh:
+                        fh.seek(rstart)
+                        remaining = end - rstart + 1
+                        while remaining > 0:
+                            try:
+                                chunk = resp.read(min(CHUNK_SIZE, remaining))
+                            except (TimeoutError, socket.timeout) as e:
+                                raise IOError(
+                                    f"读取分片超时（{read_timeout}s 内无数据）: {part_path.name} [{start}-{end}]"
+                                ) from e
+                            if not chunk:
+                                raise IOError(
+                                    f"分片提前结束（连接中断）: {part_path.name} [{start}-{end}]"
+                                )
+                            fh.write(chunk)
+                            remaining -= len(chunk)
+                return True
+            except Exception as e:  # noqa: BLE001
+                log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败: {e}")
+                if attempt < retries:
+                    time.sleep(1.5 * attempt)
+    return False
+
+
+def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, total_size: int, retries: int, read_timeout: int) -> bool:
+    """Range 分片下载 + 分片级断点续传。
+
+    - .part 按偏移写入各分片；完成状态持久化到 .part.meta.json。
+    - 重试时仅重下未完成分片，已完成分片跳过。
+    - 全部片完成后校验总大小，原子改名去掉 .part，删除 meta。
+    - 任一单片重试耗尽则文件标记失败，但保留已完成的片与 meta 供下次续传。
+    """
+    chunks = plan_chunks(total_size)
+    meta = load_chunk_meta(meta_path)
+    if meta is None or meta.get("total_size") != total_size or len(meta.get("chunks", [])) != len(chunks):
+        # 全新（或规划变化）状态：重置 part 为完整大小，保证各分片可随机写
+        chunk_states = [
+            {"start": s, "end": e, "completed": False}
+            for (s, e) in chunks
+        ]
+        with open(part_path, "wb") as fh:
+            fh.truncate(total_size)
+        meta = {"total_size": total_size, "chunks": chunk_states}
+        save_chunk_meta(meta_path, meta)
+    chunk_states = meta["chunks"]
+
+    failed_any = False
+    pending = [c for c in chunk_states if not c["completed"]]
+    while pending and not failed_any:
+        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+            futures = {
+                pool.submit(download_chunk, url, part_path, c["start"], c["end"], read_timeout, retries): c
+                for c in pending
+            }
+            for fut in as_completed(futures):
+                c = futures[fut]
+                try:
+                    ok = fut.result(timeout=30)
+                except Exception as e:  # noqa: BLE001
+                    log(f"      [分片线程异常] {part_path.name} [{c['start']}-{c['end']}]: {e}")
+                    ok = False
+                if ok:
+                    c["completed"] = True
+                else:
+                    failed_any = True
+        save_chunk_meta(meta_path, meta)
+        pending = [c for c in chunk_states if not c["completed"]]
+
+    if failed_any:
+        log(f"    [分片失败] {part_path.name}: 存在重试耗尽的分片，保留 .part 与 .meta 供下次续传")
+        return False
+    if part_path.stat().st_size != total_size:
+        log(f"    [分片失败] {part_path.name}: 大小校验失败 {part_path.stat().st_size} != {total_size}")
+        return False
+    part_path.replace(dest)
+    meta_path.unlink()
+    return True
 
 
 class Progress:
@@ -275,7 +487,10 @@ def main() -> int:
     parser.add_argument("--exclude-ext", default="", help="排除扩展名，逗号分隔，如 mp4,zip")
     parser.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS, help=f"并发线程数（默认 {DEFAULT_WORKERS}）")
     parser.add_argument("-r", "--retries", type=int, default=DEFAULT_RETRIES, help=f"单文件失败重试次数（默认 {DEFAULT_RETRIES}）")
+    parser.add_argument("--proxy", default="", help="代理地址 http://host:port（仅支持 http/https；SOCKS 代理不受支持）")
     args = parser.parse_args()
+
+    setup_network(args.proxy)
 
     types = {t.strip().lower() for t in args.types.split(",") if t.strip()}
     exts = {e.strip().lower().lstrip(".") for e in args.ext.split(",") if e.strip()}
