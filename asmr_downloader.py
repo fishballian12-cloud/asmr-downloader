@@ -26,7 +26,8 @@ from pathlib import Path
 
 API_BASE = "https://api.asmr-200.com/api"
 DEFAULT_WORKERS = 8
-DEFAULT_RETRIES = 3
+DEFAULT_RETRIES = 5
+CONNECT_TIMEOUT = 30
 CHUNK_SIZE = 256 * 1024
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) asmr-downloader/1.0"
 
@@ -172,9 +173,38 @@ def filter_leaf(node: dict, types, exts, exclude_exts) -> bool:
     return True
 
 
+def read_timeout_for_size(expected_size: int) -> int:
+    """按文件大小分级计算读超时（秒），避免大文件固定短超时误判。
+
+    <50MB 用 120s；50~200MB 用 300s；>200MB 用 600s。
+    """
+    if expected_size > 200 * 1024 * 1024:
+        return 600
+    if expected_size >= 50 * 1024 * 1024:
+        return 300
+    return 120
+
+
+def _set_read_timeout(resp, timeout: int) -> None:
+    """将响应底层 socket 的读超时调整为指定值。
+
+    urlopen 的 timeout 参数同时作用于连接与读取，连接成功后需单独调整读超时
+    以适配大文件。依赖 CPython 内部实现（resp.fp.raw._sock），失败时静默忽略。
+    """
+    try:
+        sock = resp.fp.raw._sock
+    except AttributeError:
+        return
+    try:
+        sock.settimeout(timeout)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def download_file(url: str, dest: Path, expected_size: int, retries: int) -> bool:
-    """下载单个文件：先写 .part，成功后原子改名；失败重试。"""
+    """下载单个文件：先写 .part，成功后原子改名；连接/读超时独立兜底重试。"""
     part_path = dest.with_name(dest.name + ".part")
+    read_timeout = read_timeout_for_size(expected_size)
     for attempt in range(1, retries + 1):
         try:
             if part_path.exists():
@@ -182,10 +212,18 @@ def download_file(url: str, dest: Path, expected_size: int, retries: int) -> boo
             req = urllib.request.Request(
                 quote_url(url), headers={"User-Agent": UA}
             )
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            # 连接阶段独立短超时；连接成功后按文件大小调整读超时
+            with urllib.request.urlopen(req, timeout=CONNECT_TIMEOUT) as resp:
+                _set_read_timeout(resp, read_timeout)
                 with open(part_path, "wb") as fh:
                     while True:
-                        chunk = resp.read(CHUNK_SIZE)
+                        try:
+                            chunk = resp.read(CHUNK_SIZE)
+                        except (TimeoutError, socket.timeout) as e:
+                            # 连续无数据超时：本轮视为失败，交由外层重试
+                            raise IOError(
+                                f"读取数据超时（{read_timeout}s 内无数据）: {dest.name}"
+                            ) from e
                         if not chunk:
                             break
                         fh.write(chunk)
@@ -285,6 +323,7 @@ def main() -> int:
     def worker(item):
         rel_dir, node = item
         dest = out_dir / rel_dir / sanitize_filename(node.get("title") or "untitled")
+        dest.parent.mkdir(parents=True, exist_ok=True)
         expected = int(node.get("size") or 0)
         if dest.exists() and (not expected or dest.stat().st_size == expected):
             progress.tick("skip")
@@ -295,12 +334,20 @@ def main() -> int:
             return str(dest)
         return None
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=args.workers)
+    try:
         futures = [pool.submit(worker, item) for item in selected]
         for fut in as_completed(futures):
-            err = fut.result()
+            try:
+                # 结果超时保护：正常已完成的 future 应立即返回
+                err = fut.result(timeout=30)
+            except Exception as e:  # noqa: BLE001
+                err = f"下载线程异常: {e}"
             if err:
                 failed_files.append(err)
+    finally:
+        # 兜底收尾：取消未启动任务，等待已启动任务（worker 内网络均有超时，不会永久阻塞）
+        pool.shutdown(wait=True, cancel_futures=True)
 
     log("下载完成。")
     if progress.skipped:
