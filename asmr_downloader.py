@@ -28,6 +28,7 @@ API_BASE = "https://api.asmr-200.com/api"
 DEFAULT_WORKERS = 8
 DEFAULT_RETRIES = 5
 CONNECT_TIMEOUT = 30
+DEFAULT_EXCLUDE_EXTS = {"wav", "flac"}
 CHUNK_SIZE = 256 * 1024
 MAX_ACTIVE_CHUNKS = 16
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) asmr-downloader/1.0"
@@ -494,7 +495,21 @@ def main() -> int:
 
     types = {t.strip().lower() for t in args.types.split(",") if t.strip()}
     exts = {e.strip().lower().lstrip(".") for e in args.ext.split(",") if e.strip()}
-    exclude_exts = {e.strip().lower().lstrip(".") for e in args.exclude_ext.split(",") if e.strip()}
+    explicit_exclude = {e.strip().lower().lstrip(".") for e in args.exclude_ext.split(",") if e.strip()}
+
+    # 默认过滤规则：默认排除 wav/flac 节省流量；--ext 白名单时默认排除不生效
+    if exts:
+        exclude_exts = set(explicit_exclude)
+        if explicit_exclude:
+            log(f"      过滤规则: --ext 白名单 [{','.join(sorted(exts))}]；显式排除 [{','.join(sorted(explicit_exclude))}]（默认排除 wav/flac 不生效）")
+        else:
+            log(f"      过滤规则: --ext 白名单 [{','.join(sorted(exts))}]（默认排除 wav/flac 不生效）")
+    else:
+        exclude_exts = set(DEFAULT_EXCLUDE_EXTS) | explicit_exclude
+        if explicit_exclude:
+            log(f"      过滤规则: 默认排除 [{','.join(sorted(DEFAULT_EXCLUDE_EXTS))}] ∪ 显式排除 [{','.join(sorted(explicit_exclude))}] = [{','.join(sorted(exclude_exts))}]")
+        else:
+            log(f"      过滤规则: 默认排除 [{','.join(sorted(exclude_exts))}]")
 
     # 1. 提取 RJ 号
     rj_digits = extract_rj_number(args.input)

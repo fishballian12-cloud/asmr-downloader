@@ -69,8 +69,8 @@ python asmr_downloader.py RJ01310099 --workers 4 --retries 5 --output D:/Downloa
 | `input` | ASMR 作品地址或 RJ 号（位置参数） | 必填 |
 | `-o, --output` | 下载输出目录，作品会创建在该目录下；不指定时默认下载到当前工作目录下的 `download/` 子目录 | `download/`（当前目录下） |
 | `--types` | 按 type 字段过滤，逗号分隔：`text,audio,image,other` | 不过滤 |
-| `--ext` | 按扩展名过滤，逗号分隔，如 `mp3,wav` | 不过滤 |
-| `--exclude-ext` | 排除扩展名，逗号分隔，如 `mp4,zip` | 不过滤 |
+| `--ext` | 按扩展名白名单过滤，逗号分隔，如 `mp3,wav`；指定后默认排除 wav/flac 不生效 | 不过滤 |
+| `--exclude-ext` | 排除扩展名，逗号分隔，如 `mp4,zip`；在默认排除 `wav/flac` 基础上追加 | 默认排除 `wav,flac` |
 | `-w, --workers` | 并发下载线程数 | `8` |
 | `-r, --retries` | 单文件失败重试次数 | `3` |
 
