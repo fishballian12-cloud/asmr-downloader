@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ASMR Downloader Web 管理端（Python 标准库实现，零第三方依赖）。
+
+- ThreadingHTTPServer 同时托管静态前端与 JSON API
+- 复用 asmr_downloader.py 的下载引擎（download_work），进度通过回调采集（不解析日志）
+- 任务状态持久化到 server/tasks.json，重启不丢
+- 默认监听 127.0.0.1:8000
+
+启动:  python server/server.py [--host 127.0.0.1] [--port 8000]
+"""
+
+import argparse
+import json
+import mimetypes
+import os
+import sys
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+# 使 server 可被作为脚本或模块运行（python server/server.py / python -m server.server）
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import asmr_downloader as ad  # noqa: E402
+
+SERVER_DIR = Path(__file__).resolve().parent
+WEB_DIR = SERVER_DIR / "web"
+TASKS_JSON = SERVER_DIR / "tasks.json"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8000
+DEFAULT_WORKERS = 2  # 并发下载任务数（每个任务内部还有文件级并发）
+POLL_INTERVAL = 2.0
+
+TASK_STATUS = ("queued", "running", "done", "failed", "cancelled")
+
+
+class CancelRequested(Exception):
+    """任务取消信号：由进度回调抛出，download_work 捕获后以 error=CancelRequested 结束。"""
+
+
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+class TaskStore:
+    """任务存储：内存 dict + tasks.json 落盘（写时加锁、原子替换）。"""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.Lock()
+        self.tasks = {}  # id -> task dict
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            tasks = data.get("tasks", []) if isinstance(data, dict) else data
+            if isinstance(tasks, list):
+                for t in tasks:
+                    if isinstance(t, dict) and t.get("id"):
+                        self.tasks[t["id"]] = t
+        except Exception as e:  # noqa: BLE001
+            print(f"[server] 读取 tasks.json 失败（忽略）: {e}", flush=True)
+
+    def persist(self) -> None:
+        with self._lock:
+            tmp = self.path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps({"tasks": list(self.tasks.values())}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self.path)
+
+    def get(self, task_id: str):
+        return self.tasks.get(task_id)
+
+    def all(self):
+        return list(self.tasks.values())
+
+    def put(self, task: dict) -> None:
+        self.tasks[task["id"]] = task
+
+    def update(self, task: dict, **fields) -> None:
+        task.update(fields)
+        self.persist()
+
+
+class TaskRunner:
+    """任务调度：进程内线程池并发执行 download_work，进度回调更新任务状态并持久化。"""
+
+    def __init__(self, store: TaskStore, workers: int = DEFAULT_WORKERS, default_output: str = ""):
+        self.store = store
+        self.default_output = default_output
+        self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dl-task")
+
+    def submit(self, task: dict) -> None:
+        self.store.put(task)
+        self.store.persist()
+        self.pool.submit(self._run, task["id"])
+
+    def _run(self, task_id: str) -> None:
+        task = self.store.get(task_id)
+        if not task:
+            return
+        task["status"] = "running"
+        task["started_at"] = now_str()
+        task["error"] = ""
+        task["cancel_requested"] = False
+        self.store.persist()
+        start_wall = time.monotonic()
+        bytes_done = [0]
+
+        def on_progress(stage, data):
+            if task["cancel_requested"]:
+                raise CancelRequested("用户取消")
+            if stage == "meta":
+                self.store.update(task, rj=data.get("rj", task.get("rj", "")),
+                                  title=data.get("title", task.get("title", "")))
+            elif stage == "filter":
+                selected = data.get("selected", 0)
+                self.store.update(task, files_total=selected, files_done=0,
+                                  files_ok=0, files_skip=0, files_fail=0, progress=0.0)
+            elif stage == "file":
+                files_total = max(task.get("files_total", 0), 1)
+                done = data.get("index", 0)
+                ok = data.get("ok", False)
+                skip = bool(data.get("skip", False))
+                files_ok = task.get("files_ok", 0) + (1 if ok and not skip else 0)
+                files_skip = task.get("files_skip", 0) + (1 if skip else 0)
+                files_fail = task.get("files_fail", 0) + (0 if ok else 1)
+                # 速度：以已完成文件大小 / 耗时估算（文件级粒度）
+                try:
+                    size = os.path.getsize(data["path"])
+                    bytes_done[0] += size
+                except OSError:
+                    pass
+                elapsed = max(time.monotonic() - start_wall, 0.01)
+                self.store.update(
+                    task, files_done=done, files_ok=files_ok, files_skip=files_skip,
+                    files_fail=files_fail,
+                    progress=round(done / files_total * 100, 1),
+                    speed_kbps=round(bytes_done[0] / elapsed / 1024, 1),
+                )
+            elif stage == "done":
+                self.store.persist()
+
+        opts = task.get("options", {})
+        try:
+            stats = ad.download_work(
+                task.get("url", ""),
+                output_dir=opts.get("output", "") or str(Path(os.getcwd()) / "download"),
+                types=opts.get("types", ""),
+                exts=opts.get("ext", ""),
+                exclude_exts=opts.get("exclude_ext", ""),
+                include_regex=opts.get("include_regex", ""),
+                exclude_regex=opts.get("exclude_regex", ""),
+                workers=int(opts.get("workers", ad.DEFAULT_WORKERS)),
+                retries=int(opts.get("retries", ad.DEFAULT_RETRIES)),
+                min_speed=float(opts.get("min_speed", ad.DEFAULT_MIN_SPEED)),
+                stall_time=float(opts.get("stall_time", ad.DEFAULT_STALL_TIME)),
+                preallocate=bool(opts.get("preallocate", True)),
+                on_progress=on_progress,
+            )
+        except CancelRequested as e:
+            self.store.update(task, status="cancelled", error=f"已取消: {e}",
+                              finished_at=now_str(), speed_kbps=0)
+            self.store.persist()
+            return
+        except Exception as e:  # noqa: BLE001
+            self.store.update(task, status="failed", error=f"{type(e).__name__}: {e}",
+                              finished_at=now_str(), speed_kbps=0)
+            self.store.persist()
+            return
+
+        err = stats.get("error", "")
+        if err and err.startswith("CancelRequested"):
+            self.store.update(task, status="cancelled", error="已取消",
+                              finished_at=now_str(), speed_kbps=0)
+        elif stats.get("fail", 0) > 0:
+            self.store.update(task, status="failed",
+                              error="; ".join(stats.get("failed_files", [])[:3]) or "下载失败",
+                              files_fail=stats.get("fail", 0),
+                              finished_at=now_str(), speed_kbps=0)
+        else:
+            self.store.update(task, status="done",
+                              files_total=stats.get("total", 0),
+                              files_done=stats.get("total", 0),
+                              files_ok=stats.get("success", 0),
+                              files_skip=stats.get("skip", 0),
+                              files_fail=0, progress=100.0,
+                              out_dir=stats.get("out_dir", ""),
+                              finished_at=now_str(), speed_kbps=0)
+        self.store.persist()
+
+    def create(self, url: str, options: dict) -> dict:
+        options = dict(options or {})
+        if self.default_output and not options.get("output"):
+            options["output"] = self.default_output
+        task = {
+            "id": uuid.uuid4().hex,
+            "url": url,
+            "rj": "",
+            "title": url,
+            "status": "queued",
+            "progress": 0.0,
+            "files_total": 0,
+            "files_done": 0,
+            "files_ok": 0,
+            "files_skip": 0,
+            "files_fail": 0,
+            "speed_kbps": 0,
+            "out_dir": "",
+            "error": "",
+            "options": options or {},
+            "created_at": now_str(),
+            "started_at": "",
+            "finished_at": "",
+            "retried_from": "",
+        }
+        self.submit(task)
+        return task
+
+    def retry(self, task_id: str) -> bool:
+        task = self.store.get(task_id)
+        if not task:
+            return False
+        if task["status"] in ("running", "queued"):
+            return False
+        # 复用原配置与 URL，断点续传跳过已完成文件
+        new_id = uuid.uuid4().hex
+        new_task = {
+            "id": new_id,
+            "url": task["url"],
+            "rj": task.get("rj", ""),
+            "title": task.get("title", task["url"]),
+            "status": "queued",
+            "progress": 0.0,
+            "files_total": 0,
+            "files_done": 0,
+            "files_ok": 0,
+            "files_skip": 0,
+            "files_fail": 0,
+            "speed_kbps": 0,
+            "out_dir": task.get("out_dir", ""),
+            "error": "",
+            "options": task.get("options", {}),
+            "created_at": now_str(),
+            "started_at": "",
+            "finished_at": "",
+            "retried_from": task_id,
+        }
+        self.submit(new_task)
+        return True
+
+    def cancel(self, task_id: str) -> bool:
+        task = self.store.get(task_id)
+        if not task:
+            return False
+        if task["status"] == "queued":
+            self.store.update(task, status="cancelled", error="已取消",
+                              finished_at=now_str())
+            return True
+        if task["status"] == "running":
+            task["cancel_requested"] = True
+            self.store.persist()
+            return True
+        return False
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "AsmrDownloaderServer/1.0"
+
+    def log_message(self, fmt, *args):  # 静默访问日志
+        pass
+
+    def _send_json(self, status: int, payload) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError:
+            return {}
+
+    def _serve_static(self, rel: str) -> None:
+        rel = rel.lstrip("/")
+        if not rel or rel.endswith("/"):
+            rel = "index.html"
+        target = (WEB_DIR / rel).resolve()
+        if not str(target).startswith(str(WEB_DIR.resolve())):
+            self.send_error(403, "Forbidden")
+            return
+        if not target.is_file():
+            self.send_error(404, "Not Found")
+            return
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        body = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?")[0].rstrip("/") or "/"
+        srv: "Server" = self.server
+        if path == "/api/tasks":
+            self._send_json(200, {"tasks": srv.runner.store.all()})
+        elif path.startswith("/api/tasks/"):
+            task_id = path[len("/api/tasks/"):]
+            task = srv.runner.store.get(task_id)
+            if task:
+                self._send_json(200, task)
+            else:
+                self._send_json(404, {"error": "任务不存在"})
+        elif path.startswith("/api/"):
+            self._send_json(404, {"error": "未知 API"})
+        else:
+            self._serve_static(path)
+
+    def do_POST(self):
+        path = self.path.split("?")[0].rstrip("/") or "/"
+        srv: "Server" = self.server
+        body = self._read_json_body()
+        if path == "/api/tasks":
+            urls = body.get("urls") or body.get("url") or []
+            if isinstance(urls, str):
+                urls = [urls]
+            urls = [u.strip() for u in urls if u and u.strip()]
+            if not urls:
+                self._send_json(400, {"error": "缺少下载地址（urls）"})
+                return
+            options = body.get("options", {})
+            tasks = [srv.runner.create(u, options) for u in urls]
+            self._send_json(200, {"tasks": tasks})
+        elif path.startswith("/api/tasks/"):
+            rest = path[len("/api/tasks/"):]
+            parts = rest.split("/")
+            task_id = parts[0]
+            action = parts[1] if len(parts) > 1 else ""
+            if action == "retry":
+                ok = srv.runner.retry(task_id)
+                if ok:
+                    self._send_json(200, {"ok": True})
+                else:
+                    self._send_json(400, {"error": "任务不存在或当前状态不可重试"})
+            elif action == "cancel":
+                ok = srv.runner.cancel(task_id)
+                if ok:
+                    self._send_json(200, {"ok": True})
+                else:
+                    self._send_json(400, {"error": "任务不存在或当前状态不可取消"})
+            else:
+                self._send_json(404, {"error": "未知操作"})
+        else:
+            self._send_json(404, {"error": "未知 API"})
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, addr, runner: TaskRunner):
+        super().__init__(addr, Handler)
+        self.runner = runner
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="server", description="ASMR Downloader Web 管理端")
+    ap.add_argument("--host", default=os.environ.get("ASMR_SERVER_HOST", DEFAULT_HOST))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("ASMR_SERVER_PORT", str(DEFAULT_PORT))))
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="并发下载任务数")
+    args = ap.parse_args()
+
+    store = TaskStore(TASKS_JSON)
+    runner = TaskRunner(store, workers=args.workers)
+    srv = Server((args.host, args.port), runner)
+    print(f"[server] ASMR Downloader Web 管理端启动: http://{args.host}:{args.port}", flush=True)
+    print(f"[server] 任务持久化: {TASKS_JSON}", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[server] 停止。", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

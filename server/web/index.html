@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ASMR 下载管理端</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <h1>ASMR 下载管理端</h1>
+      <span class="conn" :class="{ok: serverOk}">{{ serverOk ? '服务已连接' : '连接中…' }}</span>
+    </header>
+
+    <section class="panel create-panel">
+      <h2>新建下载</h2>
+      <textarea v-model="urlsText" rows="3"
+                placeholder="粘贴作品地址或 RJ 号，每行一个，可同时多个：&#10;https://asmr.one/work/RJ012345&#10;RJ067890"></textarea>
+      <div class="opts-row">
+        <label>并发文件线程 <input type="number" v-model.number="options.workers" min="1" max="16"></label>
+        <label>失败重试 <input type="number" v-model.number="options.retries" min="0" max="10"></label>
+        <label>输出目录 <input type="text" v-model="options.output" placeholder="留空=项目 download 目录"></label>
+      </div>
+      <button class="btn primary" :disabled="!urlsText.trim() || submitting" @click="createTasks">
+        {{ submitting ? '创建中…' : '开始下载' }}
+      </button>
+      <p class="err" v-if="createError">{{ createError }}</p>
+    </section>
+
+    <section class="panel">
+      <h2>进行中 / 排队 <span class="count">{{ activeTasks.length }}</span></h2>
+      <div v-if="activeTasks.length === 0" class="empty">暂无进行中的任务</div>
+      <div v-for="t in activeTasks" :key="t.id" class="task-card">
+        <div class="task-head">
+          <strong>{{ t.title || t.url }}</strong>
+          <span class="badge" :class="t.status">{{ statusText(t.status) }}</span>
+        </div>
+        <div class="task-sub">{{ t.rj || t.url }} · 速度 {{ fmtSpeed(t.speed_kbps) }}</div>
+        <div class="progress">
+          <div class="progress-bar" :style="{width: t.progress + '%'}"></div>
+        </div>
+        <div class="task-meta">
+          进度 {{ t.progress }}% · 文件 {{ t.files_done }}/{{ t.files_total || '?' }}
+          (成功 {{ t.files_ok }} / 跳过 {{ t.files_skip }} / 失败 {{ t.files_fail }})
+          <span class="actions">
+            <button class="btn small" @click="cancelTask(t.id)" v-if="t.status==='running'">取消</button>
+          </span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>历史记录 <span class="count">{{ historyTasks.length }}</span></h2>
+      <div v-if="historyTasks.length === 0" class="empty">暂无历史记录</div>
+      <div v-for="t in historyTasks" :key="t.id" class="task-card done">
+        <div class="task-head">
+          <strong>{{ t.title || t.url }}</strong>
+          <span class="badge" :class="t.status">{{ statusText(t.status) }}</span>
+        </div>
+        <div class="task-sub">
+          {{ t.rj || t.url }} ·
+          <template v-if="t.finished_at">完成 {{ t.finished_at }}</template>
+          <template v-else>创建 {{ t.created_at }}</template>
+        </div>
+        <div class="task-meta">
+          文件 成功 {{ t.files_ok }} / 跳过 {{ t.files_skip }} / 失败 {{ t.files_fail }}
+          <span class="err" v-if="t.error" :title="t.error">错误: {{ shortErr(t.error) }}</span>
+          <span class="actions">
+            <button class="btn small" @click="retryTask(t.id)" v-if="t.status==='failed' || t.status==='cancelled'">重试</button>
+          </span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

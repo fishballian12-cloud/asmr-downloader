@@ -32,7 +32,10 @@ API_BASE = "https://api.asmr-200.com/api"
 DEFAULT_WORKERS = 8
 DEFAULT_RETRIES = 5
 CONNECT_TIMEOUT = 30
-DEFAULT_EXCLUDE_EXTS = {"wav", "flac", "mp4"}
+# 默认音轨策略（无显式 --ext/--exclude-ext 时生效）：
+# 组内 mp3 优先（多 mp3 取最大）；无 mp3 时 wav/flac 转 m4a；视频格式硬排除；文本/图片保留
+AUDIO_STRATEGY_EXTS = {"mp3", "wav", "flac"}
+VIDEO_EXTS = {"mp4", "mkv", "webm", "avi", "mov", "m4v", "wmv", "flv", "ts", "mts", "mpg", "mpeg"}
 CHUNK_SIZE = 256 * 1024
 MAX_ACTIVE_CHUNKS = 16
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) asmr-downloader/1.0"
@@ -462,6 +465,74 @@ def filter_leaf(node: dict, types, exts, exclude_exts) -> bool:
     return True
 
 
+def to_m4a_url(url: str) -> str:
+    """把 mediaDownloadUrl 的路径后缀改为 .m4a（保留查询参数），服务器会自动转码。"""
+    parsed = urllib.parse.urlsplit(url)
+    path = parsed.path
+    if "." in path.rsplit("/", 1)[-1]:
+        path = path.rsplit(".", 1)[0] + ".m4a"
+    else:
+        path = path + ".m4a"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)
+    )
+
+
+def select_audio_member(members: list) -> tuple:
+    """音轨组内选择：mp3 优先（多个 mp3 取 size 最大）；无 mp3 有 wav/flac 则选 wav 转 m4a。
+
+    members: [(rel_dir, node), ...]（同一曲目不同扩展名）
+    返回 (rel_dir, node)，其中 wav/flac 节点被改造为 m4a 下载项：
+      - node["mediaDownloadUrl"] -> .m4a URL
+      - node["title"] -> 同名 .m4a
+      - node["_m4a"] = True（worker 据此不校验 API size，按响应实际大小）
+    """
+    def size_of(item: tuple) -> int:
+        return int(item[1].get("size") or 0)
+
+    mp3s = [m for m in members if node_ext(m[1]) == "mp3"]
+    if mp3s:
+        return max(mp3s, key=size_of)
+    wavs = [m for m in members if node_ext(m[1]) == "wav"]
+    flacs = [m for m in members if node_ext(m[1]) == "flac"]
+    if wavs or flacs:
+        chosen = max(wavs, key=size_of) if wavs else max(flacs, key=size_of)  # wav 优先
+        rel_dir, node = chosen
+        new_node = dict(node)
+        new_node["mediaDownloadUrl"] = to_m4a_url(node["mediaDownloadUrl"])
+        new_node["title"] = Path(node["title"]).stem + ".m4a"
+        new_node["_m4a"] = True
+        return (rel_dir, new_node)
+    return members[0]
+
+
+def apply_default_audio_strategy(items: list) -> tuple:
+    """默认音轨策略：视频硬排除；文本/图片/其他音频原样保留；音轨按曲目分组择优。
+
+    items: [(rel_dir, node), ...]（已按 --types 过滤）
+    返回 (selected, skipped_count)，selected 仍为 [(rel_dir, node), ...]。
+    """
+    keep = []
+    groups = {}  # (rel_dir, stem) -> [(rel_dir, node), ...]
+    skipped = 0
+    for rel_dir, node in items:
+        ext = node_ext(node)
+        ntype = (node.get("type") or "other").lower()
+        if ext in VIDEO_EXTS or ntype == "video":
+            skipped += 1
+            continue
+        if ext in AUDIO_STRATEGY_EXTS:
+            stem = Path(node.get("title") or "").stem
+            groups.setdefault((rel_dir, stem), []).append((rel_dir, node))
+        else:
+            # 文本/图片/其他音频（ogg/aac 等）保留现有下载行为
+            keep.append((rel_dir, node))
+    selected = list(keep)
+    for members in groups.values():
+        selected.append(select_audio_member(members))
+    return selected, skipped
+
+
 def probe_range_support(url: str) -> bool:
     """探测服务器是否支持 HTTP Range：用 Range: bytes=0-0 试探，206 即支持。按 host 缓存（带锁）。"""
     host = urllib.parse.urlparse(url).netloc
@@ -484,6 +555,35 @@ def probe_range_support(url: str) -> bool:
     with _range_support_lock:
         _range_support_cache[host] = supported
     return supported
+
+
+def probe_remote_size(url: str) -> int:
+    """探测远端文件实际大小（字节）：优先 Range bytes=0-0 的 Content-Range 总长，否则用 Content-Length。
+
+    用于 wav/flac 转 m4a 等"API size 不可信/未知"场景：分片规划、大小校验、
+    断点续传 meta 均以该响应实际大小为准。探测失败返回 0。
+    """
+    try:
+        pc, resp = fetch_http(quote_url(url), headers={"Range": "bytes=0-0"},
+                              read_timeout=CONNECT_TIMEOUT)
+        reusable = False
+        try:
+            if resp.status == 206:
+                cr = resp.headers.get("Content-Range", "")
+                m = re.match(r"bytes\s+0-0/(\d+)", cr)
+                resp.read(1)  # 读掉 1 字节 body，连接可干净复用
+                reusable = True
+                if m:
+                    return int(m.group(1))
+                return 0
+            cl = resp.headers.get("Content-Length", "")
+            if cl and cl.isdigit():
+                return int(cl)
+            return 0
+        finally:
+            pc.release(reusable)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def plan_chunks(total_size: int) -> list:
@@ -587,19 +687,28 @@ def download_file(url: str, dest: Path, expected_size: int, retries: int,
                   min_speed_kbps: float = DEFAULT_MIN_SPEED,
                   stall_time: float = DEFAULT_STALL_TIME,
                   preallocate: bool = True) -> bool:
-    """下载单个文件：支持 Range 时走分片断点续传，否则退化整文件流式下载。"""
+    """下载单个文件：支持 Range 时走分片断点续传，否则退化整文件流式下载。
+
+    expected_size <= 0 时（如 wav/flac 转 m4a，API size 是源文件大小不可信），
+    先探测服务端实际大小，再按实际大小规划分片 / 校验 / 续传。
+    """
     part_path = dest.with_name(dest.name + ".part")
     meta_path = dest.with_name(dest.name + ".part.meta.json")
-    read_timeout = read_timeout_for_size(expected_size)
-    _ensure_disk_space(dest, expected_size)
-    if expected_size > 0 and probe_range_support(url):
-        log(f"    [Range] {dest.name}: 分片下载（{len(plan_chunks(expected_size))} 片）")
-        return download_file_range(url, part_path, meta_path, dest, expected_size, retries, read_timeout, min_speed_kbps, stall_time, preallocate)
+    actual_size = expected_size
+    if expected_size <= 0:
+        actual_size = probe_remote_size(url)
+        if actual_size > 0:
+            log(f"    [探测] {dest.name}: 服务端实际大小 {actual_size} B（API size 不可信，以响应为准）")
+    read_timeout = read_timeout_for_size(max(actual_size, expected_size))
+    _ensure_disk_space(dest, max(actual_size, expected_size))
+    if actual_size > 0 and probe_range_support(url):
+        log(f"    [Range] {dest.name}: 分片下载（{len(plan_chunks(actual_size))} 片，总 {actual_size} B）")
+        return download_file_range(url, part_path, meta_path, dest, actual_size, retries, read_timeout, min_speed_kbps, stall_time, preallocate)
     if meta_path.exists():
         # 服务器不支持 Range：清理可能残留的分片 meta，走整文件下载
         meta_path.unlink()
     log(f"    [整文件] {dest.name}: 服务器不支持 Range，流式下载")
-    return download_file_whole(url, part_path, dest, expected_size, retries, read_timeout, min_speed_kbps, stall_time)
+    return download_file_whole(url, part_path, dest, actual_size, retries, read_timeout, min_speed_kbps, stall_time)
 
 
 def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: int, retries: int,
@@ -929,17 +1038,35 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
         types_set = {t.strip().lower() for t in types.split(",") if t.strip()}
         exts_set = {e.strip().lower().lstrip(".") for e in exts.split(",") if e.strip()}
         explicit_exclude = {e.strip().lower().lstrip(".") for e in exclude_exts.split(",") if e.strip()}
-        if exts_set:
-            exclude_set = set(explicit_exclude)
-        else:
-            exclude_set = set(DEFAULT_EXCLUDE_EXTS) | explicit_exclude
+        # 显式 --ext / --exclude-ext 覆盖默认音轨策略（保留显式优先）
+        use_default_strategy = not exts_set and not explicit_exclude
 
-        selected = []
+        # 先按 --types 过滤（type 过滤对两种模式都生效）
+        type_filtered = []
         skipped_filter = 0
         for rel_dir, node in leaves:
-            if not filter_leaf(node, types_set, exts_set, exclude_set):
+            if not filter_leaf(node, types_set, set(), set()):
                 skipped_filter += 1
                 continue
+            type_filtered.append((rel_dir, node))
+
+        if use_default_strategy:
+            selected, strategy_skipped = apply_default_audio_strategy(type_filtered)
+            skipped_filter += strategy_skipped
+            log("      音轨策略: mp3 优先，无 mp3 则 wav/flac 转 m4a，视频格式硬排除，文本/图片保留")
+        else:
+            exclude_set = set(explicit_exclude)
+            selected = []
+            for rel_dir, node in type_filtered:
+                if not filter_leaf(node, set(), exts_set, exclude_set):
+                    skipped_filter += 1
+                    continue
+                selected.append((rel_dir, node))
+            log("      显式过滤: --ext/--exclude-ext 覆盖默认音轨策略")
+
+        # 正则过滤（后置，对两种模式都生效）
+        final_selected = []
+        for rel_dir, node in selected:
             leaf_title = node.get("title") or ""
             if inc_re and not inc_re.search(leaf_title):
                 skipped_filter += 1
@@ -947,7 +1074,8 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
             if exc_re and exc_re.search(leaf_title):
                 skipped_filter += 1
                 continue
-            selected.append((rel_dir, node))
+            final_selected.append((rel_dir, node))
+        selected = final_selected
         log(f"      命中过滤规则: {len(selected)}（过滤掉 {skipped_filter}）")
         if on_progress:
             on_progress("filter", {"selected": len(selected), "skipped": skipped_filter})
@@ -976,8 +1104,10 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
                     i += 1
             used_dest_names.add(dest.name)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            expected = int(node.get("size") or 0)
-            if dest.exists() and (not expected or dest.stat().st_size == expected):
+            # m4a 转换项：API size 是源文件（wav/flac）大小，不可信 → expected=0，
+            # 大小以响应 Content-Length 为准；"已存在跳过"按目标 .m4a 存在且 size>0 判断
+            expected = 0 if node.get("_m4a") else int(node.get("size") or 0)
+            if dest.exists() and dest.stat().st_size > 0 and (not expected or dest.stat().st_size == expected):
                 progress.tick("skip")
                 if on_progress:
                     on_progress("file", {"index": progress.done, "total": progress.total,
@@ -1029,14 +1159,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         prog="asmr_downloader",
         description="ASMR 作品下载器：根据 RJ 号获取元数据与文件树并并发下载。",
+        epilog="默认音轨策略：同一曲目（同目录同文件名）组内 mp3 优先，多个 mp3 只保留最大；"
+               "无 mp3 时有 wav/flac 则下载其 m4a 转码格式（服务器自动转码，链接后缀改 .m4a，wav 优先于 flac）；"
+               "mp4/mkv/webm/avi/mov 等视频格式及 type=video 节点一律不下载；文本/图片等非音频文件正常下载。"
+               "显式提供 --ext 或 --exclude-ext 时覆盖默认策略，按指定扩展名过滤。",
     )
     parser.add_argument("input", nargs="+", help="ASMR 作品地址（如 https://asmr.one/work/RJ01310099）或 RJ 号（RJ01310099），可传多个")
     parser.add_argument("--input-file", default="", help="作品清单文件（每行一个 RJ/URL），与命令行 input 合并")
     parser.add_argument("-o", "--output", default=None, help="下载输出目录（不指定则自动使用系统下载目录）")
     parser.add_argument("--config", default="", help="配置文件 JSON 路径（默认读取脚本目录 config.json，若存在）")
     parser.add_argument("--types", default="", help="按 type 字段过滤，逗号分隔：text/audio/image/other")
-    parser.add_argument("--ext", default="", help="按扩展名过滤，逗号分隔，如 mp3,wav")
-    parser.add_argument("--exclude-ext", default="", help="排除扩展名，逗号分隔，如 mp4,zip")
+    parser.add_argument("--ext", default="", help="按扩展名过滤，逗号分隔，如 mp3,wav；显式指定后覆盖默认音轨策略")
+    parser.add_argument("--exclude-ext", default="", help="排除扩展名，逗号分隔，如 mp4,zip；显式指定后覆盖默认音轨策略")
     parser.add_argument("--include-regex", default="", help="按文件名（title）正则白名单过滤，后置过滤")
     parser.add_argument("--exclude-regex", default="", help="按文件名（title）正则黑名单过滤，后置过滤")
     parser.add_argument("-w", "--workers", type=positive_int, default=DEFAULT_WORKERS, help=f"并发线程数（默认 {DEFAULT_WORKERS}）")
