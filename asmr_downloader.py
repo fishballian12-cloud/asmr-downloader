@@ -69,10 +69,30 @@ RESERVED_NAMES = {
 }
 
 
+_log_file = None
+
+
+def set_log_file(path: str) -> None:
+    """设置日志落盘文件（UTF-8）；None/空串表示仅控制台输出。"""
+    global _log_file
+    if path:
+        Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        _log_file = open(Path(path).expanduser(), "a", encoding="utf-8")
+    else:
+        _log_file = None
+
+
 def log(msg: str) -> None:
-    """线程安全打印。"""
+    """线程安全打印，带时间戳；设置 log 文件时同时落盘。"""
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     with _print_lock:
-        print(msg, flush=True)
+        print(line, flush=True)
+        if _log_file:
+            try:
+                _log_file.write(line + "\n")
+                _log_file.flush()
+            except OSError:
+                pass
 
 
 def setup_network(proxy: str = "") -> None:
@@ -844,121 +864,278 @@ class Progress:
         log(f"  [进度] {done}/{total} ({(done / total * 100):.1f}%) 成功={self.ok} 跳过={self.skipped} 失败={self.failed}")
 
 
+def positive_int(value: str) -> int:
+    """argparse 校验：正整数。"""
+    iv = int(value)
+    if iv <= 0:
+        raise argparse.ArgumentTypeError(f"必须是正整数（当前 {value}）")
+    return iv
+
+
+def positive_float(value: str) -> float:
+    """argparse 校验：正浮点数。"""
+    fv = float(value)
+    if fv <= 0:
+        raise argparse.ArgumentTypeError(f"必须是正数（当前 {value}）")
+    return fv
+
+
+def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: str = "",
+                  exclude_exts: str = "", include_regex: str = "", exclude_regex: str = "",
+                  workers: int = DEFAULT_WORKERS, retries: int = DEFAULT_RETRIES,
+                  min_speed: float = DEFAULT_MIN_SPEED, stall_time: float = DEFAULT_STALL_TIME,
+                  preallocate: bool = True, on_progress=None) -> dict:
+    """下载单个作品完整流程：元数据 → 文件树 → 过滤 → 并发下载。
+
+    CLI 与 server 共用入口（模块化重构核心）。保持 CLI 语义向后兼容。
+    on_progress(stage, data) 可选进度回调：
+      - stage "meta":   {"rj", "title"}
+      - stage "tree":   {"leaves"}
+      - stage "filter": {"selected", "skipped"}
+      - stage "file":   {"index", "total", "path", "ok", "skip"(可选)}
+      - stage "done":   {"stats"}
+    返回 stats dict：{rj, title, out_dir, total, success, skip, fail, failed_files,
+                      error(可选)}
+    """
+    stats = {"rj": "", "title": "", "out_dir": "", "total": 0, "success": 0,
+             "skip": 0, "fail": 0, "failed_files": []}
+    try:
+        rj_digits = extract_rj_number(rj_input)
+        stats["rj"] = f"RJ{rj_digits}"
+        log(f"[1/4] 识别 RJ 号: RJ{rj_digits}")
+
+        work_info, rj_used = fetch_work_info(rj_digits)
+        title = extract_title(work_info)
+        stats["title"] = title
+        if on_progress:
+            on_progress("meta", {"rj": stats["rj"], "title": title})
+
+        folder_name = sanitize_filename(f"RJ{rj_digits}_{title}")
+        output_base = output_dir if output_dir else get_default_output_dir()
+        out_dir = Path(output_base) / folder_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stats["out_dir"] = str(out_dir)
+        log(f"[2/4] 作品: {title}")
+        log(f"      输出目录: {out_dir}")
+
+        tracks = fetch_tracks(rj_used)
+        leaves = collect_leaves(tracks)
+        log(f"[3/4] 文件树叶子节点: {len(leaves)}")
+        if on_progress:
+            on_progress("tree", {"leaves": len(leaves)})
+
+        inc_re = re.compile(include_regex) if include_regex else None
+        exc_re = re.compile(exclude_regex) if exclude_regex else None
+        types_set = {t.strip().lower() for t in types.split(",") if t.strip()}
+        exts_set = {e.strip().lower().lstrip(".") for e in exts.split(",") if e.strip()}
+        explicit_exclude = {e.strip().lower().lstrip(".") for e in exclude_exts.split(",") if e.strip()}
+        if exts_set:
+            exclude_set = set(explicit_exclude)
+        else:
+            exclude_set = set(DEFAULT_EXCLUDE_EXTS) | explicit_exclude
+
+        selected = []
+        skipped_filter = 0
+        for rel_dir, node in leaves:
+            if not filter_leaf(node, types_set, exts_set, exclude_set):
+                skipped_filter += 1
+                continue
+            leaf_title = node.get("title") or ""
+            if inc_re and not inc_re.search(leaf_title):
+                skipped_filter += 1
+                continue
+            if exc_re and exc_re.search(leaf_title):
+                skipped_filter += 1
+                continue
+            selected.append((rel_dir, node))
+        log(f"      命中过滤规则: {len(selected)}（过滤掉 {skipped_filter}）")
+        if on_progress:
+            on_progress("filter", {"selected": len(selected), "skipped": skipped_filter})
+        if not selected:
+            log("没有符合条件的文件，结束。")
+            if on_progress:
+                on_progress("done", {"stats": stats})
+            return stats
+
+        stats["total"] = len(selected)
+        log(f"[4/4] 开始下载（{workers} 线程，重试 {retries} 次）...")
+        progress = Progress(len(selected))
+        used_dest_names = set()  # P1-07: 同目录内文件名冲突唯一化
+
+        def worker(item):
+            rel_dir, node = item
+            dest = out_dir / rel_dir / sanitize_filename(node.get("title") or "untitled")
+            if dest.name in used_dest_names:
+                stem, suffix = dest.stem, dest.suffix
+                i = 1
+                while True:
+                    cand = dest.with_name(f"{stem}_{i}{suffix}")
+                    if cand.name not in used_dest_names and not cand.exists():
+                        dest = cand
+                        break
+                    i += 1
+            used_dest_names.add(dest.name)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            expected = int(node.get("size") or 0)
+            if dest.exists() and (not expected or dest.stat().st_size == expected):
+                progress.tick("skip")
+                if on_progress:
+                    on_progress("file", {"index": progress.done, "total": progress.total,
+                                         "path": str(dest), "ok": True, "skip": True})
+                return None
+            ok = download_file(node["mediaDownloadUrl"], dest, expected, retries, min_speed,
+                               stall_time, preallocate=preallocate)
+            progress.tick("ok" if ok else "fail")
+            if on_progress:
+                on_progress("file", {"index": progress.done, "total": progress.total,
+                                     "path": str(dest), "ok": ok})
+            if not ok:
+                return str(dest)
+            return None
+
+        pool = ThreadPoolExecutor(max_workers=workers)
+        failed_files = []
+        try:
+            futures = [pool.submit(worker, item) for item in selected]
+            for fut in as_completed(futures):
+                try:
+                    err = fut.result(timeout=30)
+                except Exception as e:  # noqa: BLE001
+                    err = f"下载线程异常: {e}"
+                if err:
+                    failed_files.append(err)
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+        stats["success"] = progress.ok
+        stats["skip"] = progress.skipped
+        stats["fail"] = len(failed_files)
+        stats["failed_files"] = failed_files
+        if on_progress:
+            on_progress("done", {"stats": stats})
+        return stats
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:  # noqa: BLE001
+        stats["fail"] = stats["total"] if stats["total"] else 1
+        stats["error"] = f"{type(e).__name__}: {e}"
+        log(f"[失败] 作品处理异常: {stats['error']}")
+        if on_progress:
+            on_progress("done", {"stats": stats})
+        return stats
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="asmr_downloader",
         description="ASMR 作品下载器：根据 RJ 号获取元数据与文件树并并发下载。",
     )
-    parser.add_argument("input", help="ASMR 作品地址（如 https://asmr.one/work/RJ01310099）或 RJ 号（RJ01310099）")
+    parser.add_argument("input", nargs="+", help="ASMR 作品地址（如 https://asmr.one/work/RJ01310099）或 RJ 号（RJ01310099），可传多个")
+    parser.add_argument("--input-file", default="", help="作品清单文件（每行一个 RJ/URL），与命令行 input 合并")
     parser.add_argument("-o", "--output", default=None, help="下载输出目录（不指定则自动使用系统下载目录）")
+    parser.add_argument("--config", default="", help="配置文件 JSON 路径（默认读取脚本目录 config.json，若存在）")
     parser.add_argument("--types", default="", help="按 type 字段过滤，逗号分隔：text/audio/image/other")
     parser.add_argument("--ext", default="", help="按扩展名过滤，逗号分隔，如 mp3,wav")
     parser.add_argument("--exclude-ext", default="", help="排除扩展名，逗号分隔，如 mp4,zip")
-    parser.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS, help=f"并发线程数（默认 {DEFAULT_WORKERS}）")
-    parser.add_argument("-r", "--retries", type=int, default=DEFAULT_RETRIES, help=f"单文件失败重试次数（默认 {DEFAULT_RETRIES}）")
+    parser.add_argument("--include-regex", default="", help="按文件名（title）正则白名单过滤，后置过滤")
+    parser.add_argument("--exclude-regex", default="", help="按文件名（title）正则黑名单过滤，后置过滤")
+    parser.add_argument("-w", "--workers", type=positive_int, default=DEFAULT_WORKERS, help=f"并发线程数（默认 {DEFAULT_WORKERS}）")
+    parser.add_argument("-r", "--retries", type=positive_int, default=DEFAULT_RETRIES, help=f"单文件失败重试次数（默认 {DEFAULT_RETRIES}）")
     parser.add_argument("--proxy", default="", help="代理地址 http://host:port（仅支持 http/https；SOCKS 代理不受支持）")
-    parser.add_argument("--min-speed", type=float, default=DEFAULT_MIN_SPEED, help=f"最低平均速度看门狗阈值 KB/s（默认 {DEFAULT_MIN_SPEED}）")
-    parser.add_argument("--stall-time", type=float, default=DEFAULT_STALL_TIME, help=f"平均速率低于阈值持续秒数后中断连接触发重试（默认 {DEFAULT_STALL_TIME}）")
+    parser.add_argument("--min-speed", type=positive_float, default=DEFAULT_MIN_SPEED, help=f"最低平均速度看门狗阈值 KB/s（默认 {DEFAULT_MIN_SPEED}）")
+    parser.add_argument("--stall-time", type=positive_float, default=DEFAULT_STALL_TIME, help=f"平均速率低于阈值持续秒数后中断连接触发重试（默认 {DEFAULT_STALL_TIME}）")
+    parser.add_argument("--log-file", default="", help="日志落盘文件路径（UTF-8，追加）")
     parser.add_argument("--no-preallocate", action="store_true", help="不预分配磁盘空间（稀疏式边下边写），磁盘占用按实际写入增长")
     args = parser.parse_args()
 
+    # P1-10 配置合并：环境变量 > CLI 显式参数 > config.json（默认脚本目录 config.json / --config 指定）
+    if args.config:
+        cfg_path = Path(args.config).expanduser()
+    else:
+        cfg_path = Path(__file__).resolve().parent / "config.json"
+    cfg = {}
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            log(f"[配置] 警告: 读取配置文件 {cfg_path} 失败: {e}")
+    if not args.proxy:
+        args.proxy = os.environ.get("ASMR_PROXY", cfg.get("proxy", ""))
+    if not args.output:
+        args.output = os.environ.get("ASMR_OUTPUT", cfg.get("output", None))
+    for key in ("types", "ext", "exclude_ext", "include_regex", "exclude_regex",
+                "log_file", "input_file"):
+        if not getattr(args, key):
+            setattr(args, key, cfg.get(key, ""))
+
+    if args.log_file:
+        set_log_file(args.log_file)
+        log(f"[日志] 落盘: {args.log_file}")
+
     setup_network(args.proxy)
 
-    types = {t.strip().lower() for t in args.types.split(",") if t.strip()}
-    exts = {e.strip().lower().lstrip(".") for e in args.ext.split(",") if e.strip()}
-    explicit_exclude = {e.strip().lower().lstrip(".") for e in args.exclude_ext.split(",") if e.strip()}
-
-    # 默认过滤规则：默认排除 wav/flac 节省流量；--ext 白名单时默认排除不生效
-    if exts:
-        exclude_exts = set(explicit_exclude)
-        if explicit_exclude:
-            log(f"      过滤规则: --ext 白名单 [{','.join(sorted(exts))}]；显式排除 [{','.join(sorted(explicit_exclude))}]（默认排除 wav/flac 不生效）")
-        else:
-            log(f"      过滤规则: --ext 白名单 [{','.join(sorted(exts))}]（默认排除 wav/flac 不生效）")
-    else:
-        exclude_exts = set(DEFAULT_EXCLUDE_EXTS) | explicit_exclude
-        if explicit_exclude:
-            log(f"      过滤规则: 默认排除 [{','.join(sorted(DEFAULT_EXCLUDE_EXTS))}] ∪ 显式排除 [{','.join(sorted(explicit_exclude))}] = [{','.join(sorted(exclude_exts))}]")
-        else:
-            log(f"      过滤规则: 默认排除 [{','.join(sorted(exclude_exts))}]")
-
-    # 1. 提取 RJ 号
-    rj_digits = extract_rj_number(args.input)
-    log(f"[1/4] 识别 RJ 号: RJ{rj_digits}")
-
-    # 2. 获取元数据
-    work_info, rj_used = fetch_work_info(rj_digits)
-    title = extract_title(work_info)
-    folder_name = sanitize_filename(f"RJ{rj_digits}_{title}")
-    output_base = args.output if args.output else get_default_output_dir()
     if not args.output:
-        log(f"      未指定 -o，默认下载到当前目录下的 download 子目录: {output_base}")
-        Path(output_base).mkdir(parents=True, exist_ok=True)
-    out_dir = Path(output_base) / folder_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log(f"[2/4] 作品: {title}")
-    log(f"      输出目录: {out_dir}")
+        log(f"      未指定 -o，默认下载到当前目录下的 download 子目录: {get_default_output_dir()}")
+    log(f"      代理: {args.proxy or '系统默认'} | 并发 {args.workers} | 重试 {args.retries}")
 
-    # 3. 获取文件树并过滤
-    tracks = fetch_tracks(rj_used)
-    leaves = collect_leaves(tracks)
-    log(f"[3/4] 文件树叶子节点: {len(leaves)}")
-
-    selected = []
-    skipped_filter = 0
-    for rel_dir, node in leaves:
-        if filter_leaf(node, types, exts, exclude_exts):
-            selected.append((rel_dir, node))
-        else:
-            skipped_filter += 1
-    log(f"      命中过滤规则: {len(selected)}（过滤掉 {skipped_filter}）")
-    if not selected:
-        log("没有符合条件的文件，结束。")
+    inputs = list(args.input)
+    if args.input_file:
+        try:
+            with open(args.input_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        inputs.append(line)
+        except OSError as e:
+            log(f"[参数] 读取 --input-file 失败: {e}")
+            return 2
+    if not inputs:
+        log("没有可下载的作品。")
         return 0
 
-    # 4. 并发下载
-    log(f"[4/4] 开始下载（{args.workers} 线程，重试 {args.retries} 次）...")
-    progress = Progress(len(selected))
-    failed_files = []
-
-    def worker(item):
-        rel_dir, node = item
-        dest = out_dir / rel_dir / sanitize_filename(node.get("title") or "untitled")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        expected = int(node.get("size") or 0)
-        if dest.exists() and (not expected or dest.stat().st_size == expected):
-            progress.tick("skip")
-            return None
-        ok = download_file(node["mediaDownloadUrl"], dest, expected, args.retries, args.min_speed, args.stall_time, preallocate=not args.no_preallocate)
-        progress.tick("ok" if ok else "fail")
-        if not ok:
-            return str(dest)
-        return None
-
-    pool = ThreadPoolExecutor(max_workers=args.workers)
+    # 批量汇总统计（P1-08）
+    summary = {"works": 0, "total": 0, "success": 0, "skip": 0, "fail": 0,
+               "failed_files": [], "started": time.monotonic()}
+    exit_code = 0
     try:
-        futures = [pool.submit(worker, item) for item in selected]
-        for fut in as_completed(futures):
-            try:
-                # 结果超时保护：正常已完成的 future 应立即返回
-                err = fut.result(timeout=30)
-            except Exception as e:  # noqa: BLE001
-                err = f"下载线程异常: {e}"
-            if err:
-                failed_files.append(err)
-    finally:
-        # 兜底收尾：取消未启动任务，等待已启动任务（worker 内网络均有超时，不会永久阻塞）
-        pool.shutdown(wait=True, cancel_futures=True)
+        for idx, rj_input in enumerate(inputs, 1):
+            log(f"\n===== 作品 [{idx}/{len(inputs)}]: {rj_input} =====")
+            stats = download_work(
+                rj_input, output_dir=args.output, types=args.types, exts=args.ext,
+                exclude_exts=args.exclude_ext, include_regex=args.include_regex,
+                exclude_regex=args.exclude_regex, workers=args.workers, retries=args.retries,
+                min_speed=args.min_speed, stall_time=args.stall_time,
+                preallocate=not args.no_preallocate,
+            )
+            summary["works"] += 1
+            summary["total"] += stats["total"]
+            summary["success"] += stats["success"]
+            summary["skip"] += stats["skip"]
+            summary["fail"] += stats["fail"]
+            summary["failed_files"].extend(stats.get("failed_files", []))
+            if stats.get("error"):
+                summary["failed_files"].append(f"{stats['rj']}: {stats['error']}")
+                exit_code = 1
+            elif stats["fail"]:
+                exit_code = 1
+            if idx < len(inputs):
+                # 多作品之间错开启动间隔（历史经验：同启触发代理 TLS 重置）
+                time.sleep(2.0)
+    except KeyboardInterrupt:
+        log("\n已中断。未完成文件保留 .part 与 .part.meta.json，下次运行自动续传。")
+        return 130
 
-    log("下载完成。")
-    if progress.skipped:
-        log(f"  跳过已存在完整文件: {progress.skipped}")
-    if failed_files:
-        log(f"  失败文件 ({len(failed_files)}):")
-        for f in failed_files:
+    elapsed = time.monotonic() - summary["started"]
+    log("\n===== 批量下载汇总 =====")
+    log(f"  作品: {summary['works']} | 文件: 总 {summary['total']} / 成功 {summary['success']} / 跳过 {summary['skip']} / 失败 {summary['fail']}")
+    log(f"  总耗时: {elapsed:.1f}s")
+    if summary["fail"]:
+        log(f"  失败文件 ({len(summary['failed_files'])}):")
+        for f in summary["failed_files"]:
             log(f"    - {f}")
-        return 1
-    return 0
+    else:
+        log("  全部成功。")
+    return exit_code
 
 
 if __name__ == "__main__":
