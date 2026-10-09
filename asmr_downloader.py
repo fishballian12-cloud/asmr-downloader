@@ -36,6 +36,10 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) asmr-downloader/1.0"
 DEFAULT_MIN_SPEED = 20.0          # 最低平均速度看门狗阈值（KB/s）
 DEFAULT_STALL_TIME = 30.0         # 平均速率低于阈值持续秒数后中断连接触发重试
 WATCHDOG_CHECK_BYTES = 1024 * 1024  # 每写入约 1MB 检查一次平均速率
+API_RETRY_TIMES = 3               # API 请求（元数据/文件树）网络类失败重试次数
+API_RETRY_BASE_DELAY = 1.0        # API 重试指数退避基数（秒）
+MAX_JSON_BODY = 50 * 1024 * 1024  # API JSON 响应体上限（50MB），防内存暴涨
+DISK_SPACE_FACTOR = 1.1           # 磁盘预检冗余系数：预留 1.1 倍文件大小空间
 
 _print_lock = threading.Lock()
 _state_lock = threading.Lock()
@@ -89,6 +93,50 @@ class StallError(Exception):
     """最低速度看门狗触发的中断信号：平均速率低于阈值且持续超过 stall-time，主动中断连接触发重试。"""
 
 
+# 可重试的网络类异常集合：重试循环仅对这类异常重试，本地/确定性错误直接判定失败。
+# 注意：本地 IO 错误（磁盘满 OSError / PermissionError / ValueError 等）不在集合内。
+RETRYABLE_EXCEPTIONS = (
+    urllib.error.URLError,
+    TimeoutError,
+    socket.timeout,
+    ConnectionError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+)
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """判断异常是否属于可重试的网络类错误（含看门狗触发）。"""
+    return isinstance(exc, RETRYABLE_EXCEPTIONS) or isinstance(exc, StallError)
+
+
+def _sleep_backoff(attempt: int) -> None:
+    """指数退避 + 随机抖动，避免多线程同步重试风暴。"""
+    base = API_RETRY_BASE_DELAY * (2 ** max(0, attempt - 1))
+    time.sleep(max(0.0, base + random.uniform(0, 0.5)))
+
+
+def _ensure_disk_space(dest: Path, expected_size: int) -> None:
+    """预检目标盘剩余空间是否足够容纳 expected_size（含 1.1 倍冗余），不足直接拒绝。
+
+    无法探测磁盘空间（如相对路径异常）时静默跳过预检。
+    """
+    if expected_size <= 0:
+        return
+    try:
+        anchor = dest.anchor or Path.cwd().anchor
+        free_bytes = shutil.disk_usage(anchor).free
+    except OSError:
+        return
+    need = int(expected_size * DISK_SPACE_FACTOR)
+    if free_bytes < need:
+        raise OSError(
+            f"磁盘空间不足: 需要约 {need / (1024 * 1024):.1f} MB（文件 {expected_size / (1024 * 1024):.1f} MB），"
+            f"目标盘 {anchor} 剩余 {free_bytes / (1024 * 1024):.1f} MB，拒绝下载"
+        )
+
+
 def _open_url(req, timeout: int):
     """打开请求：已配置代理时走全局 opener，否则用默认 urlopen（系统代理/直连）。"""
     if _global_opener is not None:
@@ -96,12 +144,34 @@ def _open_url(req, timeout: int):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def http_get_json(url: str, timeout: int = 30) -> object:
-    """GET 请求并解析 JSON。"""
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with _open_url(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8")
-    return json.loads(body)
+def http_get_json(url: str, timeout: int = 30, retries: int = API_RETRY_TIMES) -> object:
+    """GET 请求并解析 JSON。
+
+    - 网络类异常自动重试（指数退避 + 抖动），仅重试可重试错误；
+    - 响应体受 MAX_JSON_BODY 上限保护，防内存暴涨；
+    - 确定性错误（内容/协议问题）直接抛出，不重试。
+    """
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with _open_url(req, timeout=timeout) as resp:
+                length_header = resp.headers.get("Content-Length")
+                if length_header and length_header.isdigit() and int(length_header) > MAX_JSON_BODY:
+                    raise ValueError(f"响应体过大 ({length_header} B > {MAX_JSON_BODY} B)，拒绝解析")
+                body = resp.read(MAX_JSON_BODY + 1)
+                if len(body) > MAX_JSON_BODY:
+                    raise ValueError(f"响应体超过上限 {MAX_JSON_BODY} B，拒绝解析")
+                return json.loads(body.decode("utf-8"))
+        except ValueError as e:
+            # 确定性问题（协议/内容/JSON 解析错误）：不重试，直接抛出
+            raise
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            if attempt < retries:
+                log(f"      [API重试] {url} 第 {attempt}/{retries} 次失败: {e}")
+                _sleep_backoff(attempt)
+    raise RuntimeError(f"API 请求失败（重试 {retries} 次）: {url}: {last_exc}")
 
 
 def quote_url(url: str) -> str:
@@ -339,14 +409,16 @@ def _enforce_min_speed(total_bytes: int, conn_start: float, stall_started: float
 
 def download_file(url: str, dest: Path, expected_size: int, retries: int,
                   min_speed_kbps: float = DEFAULT_MIN_SPEED,
-                  stall_time: float = DEFAULT_STALL_TIME) -> bool:
+                  stall_time: float = DEFAULT_STALL_TIME,
+                  preallocate: bool = True) -> bool:
     """下载单个文件：支持 Range 时走分片断点续传，否则退化整文件流式下载。"""
     part_path = dest.with_name(dest.name + ".part")
     meta_path = dest.with_name(dest.name + ".part.meta.json")
     read_timeout = read_timeout_for_size(expected_size)
+    _ensure_disk_space(dest, expected_size)
     if expected_size > 0 and probe_range_support(url):
         log(f"    [Range] {dest.name}: 分片下载（{len(plan_chunks(expected_size))} 片）")
-        return download_file_range(url, part_path, meta_path, dest, expected_size, retries, read_timeout, min_speed_kbps, stall_time)
+        return download_file_range(url, part_path, meta_path, dest, expected_size, retries, read_timeout, min_speed_kbps, stall_time, preallocate)
     if meta_path.exists():
         # 服务器不支持 Range：清理可能残留的分片 meta，走整文件下载
         meta_path.unlink()
@@ -407,10 +479,17 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
                 )
             part_path.replace(dest)
             return True
-        except Exception as e:  # noqa: BLE001
+        except StallError as e:
+            log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败(看门狗): {e}")
+            if attempt < retries:
+                _sleep_backoff(attempt)
+        except RETRYABLE_EXCEPTIONS as e:
             log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败: {e}")
             if attempt < retries:
-                time.sleep(1.5 * attempt)
+                _sleep_backoff(attempt)
+        except Exception as e:
+            log(f"    [失败] {dest.name} 不可重试错误({type(e).__name__}): {e}")
+            return False
     return False
 
 
@@ -477,35 +556,62 @@ def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout
                 if elapsed > 0:
                     log(f"      [分片完成] {part_path.name} [{start}-{end}] 平均速度 {format_speed(total_bytes / elapsed)}")
                 return True
-            except Exception as e:  # noqa: BLE001
+            except StallError as e:
+                log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败(看门狗): {e}")
+                if attempt < retries:
+                    _sleep_backoff(attempt)
+            except RETRYABLE_EXCEPTIONS as e:
                 log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败: {e}")
                 if attempt < retries:
-                    time.sleep(1.5 * attempt)
+                    _sleep_backoff(attempt)
+            except Exception as e:
+                log(f"      [分片失败] {part_path.name} [{start}-{end}] 不可重试错误({type(e).__name__}): {e}")
+                return False
     return False
 
 
 def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, total_size: int, retries: int,
                         read_timeout: int,
                         min_speed_kbps: float = DEFAULT_MIN_SPEED,
-                        stall_time: float = DEFAULT_STALL_TIME) -> bool:
+                        stall_time: float = DEFAULT_STALL_TIME,
+                        preallocate: bool = True) -> bool:
     """Range 分片下载 + 分片级断点续传。
 
     - .part 按偏移写入各分片；完成状态持久化到 .part.meta.json。
+    - 入口自愈：meta 无效、或 .part 缺失 / 大小与预期不符（预分配模式）时，统一重置分片状态。
     - 重试时仅重下未完成分片，已完成分片跳过。
     - 全部片完成后校验总大小，原子改名去掉 .part，删除 meta。
     - 任一单片重试耗尽则文件标记失败，但保留已完成的片与 meta 供下次续传。
+    - preallocate=False 时不做全量预分配，分片按偏移写入时自动扩展（稀疏式边下边写）。
     """
     chunks = plan_chunks(total_size)
     meta = load_chunk_meta(meta_path)
-    if meta is None or meta.get("total_size") != total_size or len(meta.get("chunks", [])) != len(chunks):
-        # 全新（或规划变化）状态：重置 part 为完整大小，保证各分片可随机写
+    meta_preallocate = meta.get("preallocate", True) if meta else True
+    size_mismatch = (
+        meta is not None and meta_preallocate
+        and part_path.exists() and part_path.stat().st_size != total_size
+    )
+    reset_required = (
+        meta is None
+        or meta.get("total_size") != total_size
+        or len(meta.get("chunks", [])) != len(chunks)
+        or not part_path.exists()
+        or size_mismatch
+    )
+    if reset_required:
+        # 全新 / 规划变化 / 磁盘不一致：重置 part 与分片状态
         chunk_states = [
             {"start": s, "end": e, "completed": False}
             for (s, e) in chunks
         ]
-        with open(part_path, "wb") as fh:
-            fh.truncate(total_size)
-        meta = {"total_size": total_size, "chunks": chunk_states}
+        if preallocate:
+            with open(part_path, "wb") as fh:
+                fh.truncate(total_size)
+        else:
+            # 不预分配：仅创建空文件，各分片按偏移写入时自动扩展
+            with open(part_path, "wb"):
+                pass
+        meta = {"total_size": total_size, "chunks": chunk_states, "preallocate": preallocate}
         save_chunk_meta(meta_path, meta)
     chunk_states = meta["chunks"]
 
@@ -580,6 +686,7 @@ def main() -> int:
     parser.add_argument("--proxy", default="", help="代理地址 http://host:port（仅支持 http/https；SOCKS 代理不受支持）")
     parser.add_argument("--min-speed", type=float, default=DEFAULT_MIN_SPEED, help=f"最低平均速度看门狗阈值 KB/s（默认 {DEFAULT_MIN_SPEED}）")
     parser.add_argument("--stall-time", type=float, default=DEFAULT_STALL_TIME, help=f"平均速率低于阈值持续秒数后中断连接触发重试（默认 {DEFAULT_STALL_TIME}）")
+    parser.add_argument("--no-preallocate", action="store_true", help="不预分配磁盘空间（稀疏式边下边写），磁盘占用按实际写入增长")
     args = parser.parse_args()
 
     setup_network(args.proxy)
@@ -649,7 +756,7 @@ def main() -> int:
         if dest.exists() and (not expected or dest.stat().st_size == expected):
             progress.tick("skip")
             return None
-        ok = download_file(node["mediaDownloadUrl"], dest, expected, args.retries, args.min_speed, args.stall_time)
+        ok = download_file(node["mediaDownloadUrl"], dest, expected, args.retries, args.min_speed, args.stall_time, preallocate=not args.no_preallocate)
         progress.tick("ok" if ok else "fail")
         if not ok:
             return str(dest)
