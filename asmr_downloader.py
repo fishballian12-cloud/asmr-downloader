@@ -12,9 +12,12 @@ ASMR 作品下载器命令行工具。
 """
 
 import argparse
+import http.client
 import json
 import os
+import random
 import re
+import shutil
 import socket
 import sys
 import threading
@@ -47,8 +50,14 @@ _chunk_semaphore = threading.BoundedSemaphore(MAX_ACTIVE_CHUNKS)
 
 # 全局 opener（--proxy 配置后生效）；None 表示使用系统默认（系统代理/直连）
 _global_opener = None
-# Range 支持探测缓存（按 host）
+# 全局代理地址原文（连接池按 (scheme, host, port, proxy) 复用连接）
+_global_proxy = ""
+# Range 支持探测缓存（按 host），加锁防并发重复探测
 _range_support_cache = {}
+_range_support_lock = threading.Lock()
+# per-host 连接池（P0-05 keep-alive 复用）
+_pools: dict = {}
+_pools_lock = threading.Lock()
 
 # Windows 文件名非法字符（含控制字符）
 INVALID_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
@@ -71,7 +80,8 @@ def setup_network(proxy: str = "") -> None:
 
     仅支持 http:// 与 https:// 代理；SOCKS 代理（socks5:// 等）不受支持，忽略并警告。
     """
-    global _global_opener
+    global _global_opener, _global_proxy
+    _global_proxy = proxy.strip() if proxy else ""
     if not proxy:
         _global_opener = None
         return
@@ -80,6 +90,7 @@ def setup_network(proxy: str = "") -> None:
     if scheme in ("socks", "socks4", "socks5"):
         log("[代理] 警告: 不支持 SOCKS 代理，忽略 --proxy，使用系统默认网络")
         _global_opener = None
+        _global_proxy = ""
         return
     if scheme not in ("http", "https"):
         raise ValueError(f"不支持的代理协议: {proxy}（仅支持 http:// 或 https://）")
@@ -93,6 +104,10 @@ class StallError(Exception):
     """最低速度看门狗触发的中断信号：平均速率低于阈值且持续超过 stall-time，主动中断连接触发重试。"""
 
 
+class RetryableHTTPError(IOError):
+    """服务端瞬时错误（HTTP 408/429/5xx）：归类为可重试，由重试循环接管。"""
+
+
 # 可重试的网络类异常集合：重试循环仅对这类异常重试，本地/确定性错误直接判定失败。
 # 注意：本地 IO 错误（磁盘满 OSError / PermissionError / ValueError 等）不在集合内。
 RETRYABLE_EXCEPTIONS = (
@@ -103,12 +118,13 @@ RETRYABLE_EXCEPTIONS = (
     ConnectionResetError,
     ConnectionAbortedError,
     BrokenPipeError,
+    http.client.HTTPException,  # 连接池/协议层异常（BadStatusLine 等）
 )
 
 
 def _is_retryable(exc: BaseException) -> bool:
-    """判断异常是否属于可重试的网络类错误（含看门狗触发）。"""
-    return isinstance(exc, RETRYABLE_EXCEPTIONS) or isinstance(exc, StallError)
+    """判断异常是否属于可重试的网络类错误（含看门狗/服务端瞬时错误）。"""
+    return isinstance(exc, RETRYABLE_EXCEPTIONS) or isinstance(exc, (StallError, RetryableHTTPError))
 
 
 def _sleep_backoff(attempt: int) -> None:
@@ -137,11 +153,142 @@ def _ensure_disk_space(dest: Path, expected_size: int) -> None:
         )
 
 
-def _open_url(req, timeout: int):
-    """打开请求：已配置代理时走全局 opener，否则用默认 urlopen（系统代理/直连）。"""
-    if _global_opener is not None:
-        return _global_opener.open(req, timeout=timeout)
-    return urllib.request.urlopen(req, timeout=timeout)
+class _PooledConnection:
+    """持有 http.client 连接的池化连接；复用前需确认底层 socket 仍存活。
+
+    - 代理 http 请求用绝对 URI；https 走 CONNECT 隧道（set_tunnel）。
+    - 连接阶段超时统一 CONNECT_TIMEOUT；读超时在 request() 中按需调整。
+    """
+    __slots__ = ("scheme", "host", "port", "proxy", "conn", "in_use", "dead", "pool")
+
+    def __init__(self, pool: "ConnectionPool", scheme: str, host: str, port: int, proxy: str, timeout: int):
+        self.scheme = scheme
+        self.host = host
+        self.port = port
+        self.proxy = proxy
+        self.in_use = False
+        self.dead = False
+        self.pool = pool
+        if proxy:
+            phost, pport = _parse_proxy_endpoint(proxy)
+            conn = http.client.HTTPConnection(phost, pport, timeout=timeout)
+            if scheme == "https":
+                conn.set_tunnel(host, port)
+        elif scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        self.conn = conn
+
+    def alive(self) -> bool:
+        return (not self.dead) and self.conn.sock is not None
+
+    def request(self, method: str, target: str, headers: dict, read_timeout=None):
+        """发送请求并返回响应；连接建立后按需调整底层 socket 读超时。"""
+        self.conn.request(method, target, headers=headers)
+        resp = self.conn.getresponse()
+        if read_timeout is not None and self.conn.sock is not None:
+            try:
+                self.conn.sock.settimeout(read_timeout)
+            except Exception:
+                pass
+        return resp
+
+    def close(self) -> None:
+        if not self.dead:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.dead = True
+
+    def release(self, reusable: bool = True) -> None:
+        """归还连接：可复用则放回池，否则关闭。异常/未读完时必须传 False。"""
+        self.pool.release(self, reusable)
+
+
+class ConnectionPool:
+    """per-(scheme, host, port, proxy) 连接池，线程安全：获取/归还/失效重建。"""
+
+    def __init__(self, scheme: str, host: str, port: int, proxy: str, timeout: int):
+        self.scheme = scheme
+        self.host = host
+        self.port = port
+        self.proxy = proxy
+        self.timeout = timeout
+        self._idle = []
+        self._lock = threading.Lock()
+
+    def acquire(self) -> _PooledConnection:
+        with self._lock:
+            while self._idle:
+                pc = self._idle.pop()
+                if pc.alive():
+                    pc.in_use = True
+                    return pc
+                pc.close()
+        return _PooledConnection(self, self.scheme, self.host, self.port, self.proxy, self.timeout)
+
+    def release(self, pc: _PooledConnection, reusable: bool) -> None:
+        if pc.dead or not reusable:
+            pc.close()
+            return
+        pc.in_use = False
+        with self._lock:
+            self._idle.append(pc)
+
+
+def _parse_proxy_endpoint(proxy: str):
+    """解析代理地址为 (host, port)；解析失败抛 ValueError。"""
+    m = re.match(
+        r"^(?P<scheme>[a-z][a-z0-9+.-]*)://(?P<host>[^/:]+)(?::(?P<port>\d+))?",
+        proxy.strip(),
+    )
+    if not m:
+        raise ValueError(f"无法解析代理地址: {proxy!r}")
+    scheme = m.group("scheme").lower()
+    host = m.group("host")
+    port = int(m.group("port") or (443 if scheme == "https" else 8080))
+    return host, port
+
+
+def get_connection(url: str):
+    """按 URL 获取池化连接，返回 (conn, urlparse 结果)。"""
+    parsed = urllib.parse.urlparse(url)
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname
+    port = parsed.port or (443 if scheme == "https" else 80)
+    proxy = _global_proxy
+    key = (scheme, host, port, proxy)
+    with _pools_lock:
+        pool = _pools.get(key)
+        if pool is None:
+            pool = ConnectionPool(scheme, host, port, proxy, CONNECT_TIMEOUT)
+            _pools[key] = pool
+    return pool.acquire(), parsed
+
+
+def fetch_http(url: str, headers: dict = None, method: str = "GET",
+               read_timeout: int = None):
+    """发起 HTTP 请求，返回 (池化连接, HTTPResponse)。
+
+    - 调用方读完响应体后必须 release(pc, True)；异常/未读完时 release(pc, False)。
+    - 代理 http：请求行用绝对 URI；https：经 CONNECT 隧道后仍用 path。
+    - 连接超时用 CONNECT_TIMEOUT（池化连接创建时生效）；读超时由 read_timeout 控制。
+    """
+    pc, parsed = get_connection(url)
+    if pc.proxy and pc.scheme == "http":
+        target = url
+    else:
+        target = (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "")
+    hdrs = dict(headers or {})
+    hdrs.setdefault("User-Agent", UA)
+    try:
+        resp = pc.request(method, target, hdrs, read_timeout=read_timeout)
+        return pc, resp
+    except Exception:
+        pc.close()
+        raise
 
 
 def http_get_json(url: str, timeout: int = 30, retries: int = API_RETRY_TIMES) -> object:
@@ -153,16 +300,22 @@ def http_get_json(url: str, timeout: int = 30, retries: int = API_RETRY_TIMES) -
     """
     last_exc = None
     for attempt in range(1, retries + 1):
+        reusable = False
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with _open_url(req, timeout=timeout) as resp:
+            pc, resp = fetch_http(url, read_timeout=timeout)
+            try:
+                if resp.status != 200:
+                    raise IOError(f"HTTP {resp.status}")
                 length_header = resp.headers.get("Content-Length")
                 if length_header and length_header.isdigit() and int(length_header) > MAX_JSON_BODY:
                     raise ValueError(f"响应体过大 ({length_header} B > {MAX_JSON_BODY} B)，拒绝解析")
                 body = resp.read(MAX_JSON_BODY + 1)
                 if len(body) > MAX_JSON_BODY:
                     raise ValueError(f"响应体超过上限 {MAX_JSON_BODY} B，拒绝解析")
+                reusable = True
                 return json.loads(body.decode("utf-8"))
+            finally:
+                pc.release(reusable)
         except ValueError as e:
             # 确定性问题（协议/内容/JSON 解析错误）：不重试，直接抛出
             raise
@@ -290,23 +443,26 @@ def filter_leaf(node: dict, types, exts, exclude_exts) -> bool:
 
 
 def probe_range_support(url: str) -> bool:
-    """探测服务器是否支持 HTTP Range：用 Range: bytes=0-0 试探，206 即支持。按 host 缓存。"""
+    """探测服务器是否支持 HTTP Range：用 Range: bytes=0-0 试探，206 即支持。按 host 缓存（带锁）。"""
     host = urllib.parse.urlparse(url).netloc
-    if host in _range_support_cache:
-        return _range_support_cache[host]
+    with _range_support_lock:
+        if host in _range_support_cache:
+            return _range_support_cache[host]
     supported = False
+    reusable = False
     try:
-        req = urllib.request.Request(
-            quote_url(url), headers={"User-Agent": UA, "Range": "bytes=0-0"}
-        )
-        with _open_url(req, timeout=CONNECT_TIMEOUT) as resp:
-            if resp.getcode() == 206:
+        pc, resp = fetch_http(quote_url(url), headers={"Range": "bytes=0-0"}, read_timeout=CONNECT_TIMEOUT)
+        try:
+            resp.read()  # 读掉 1 字节 body，保证连接可干净复用
+            if resp.status == 206 or resp.headers.get("Accept-Ranges", "").lower() == "bytes":
                 supported = True
-            elif resp.headers.get("Accept-Ranges", "").lower() == "bytes":
-                supported = True
+            reusable = True
+        finally:
+            pc.release(reusable)
     except Exception:  # noqa: BLE001
         supported = False
-    _range_support_cache[host] = supported
+    with _range_support_lock:
+        _range_support_cache[host] = supported
     return supported
 
 
@@ -435,13 +591,13 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
         try:
             if part_path.exists():
                 part_path.unlink()
-            req = urllib.request.Request(
-                quote_url(url), headers={"User-Agent": UA}
-            )
-            # 连接阶段独立短超时；连接成功后按文件大小调整读超时
-            with _open_url(req, timeout=CONNECT_TIMEOUT) as resp:
-                # 读超时收紧到 min(read_timeout, stall_time)：保证“长时间无数据”在 stall-time 内被发现
-                _set_read_timeout(resp, min(read_timeout, stall_time))
+            pc, resp = fetch_http(quote_url(url), read_timeout=min(read_timeout, stall_time))
+            reusable = False
+            try:
+                if resp.status != 200:
+                    if resp.status in (408, 429) or resp.status >= 500:
+                        raise RetryableHTTPError(f"服务端瞬时错误 HTTP {resp.status}")
+                    raise IOError(f"HTTP {resp.status}")
                 conn_start = time.monotonic()
                 total_bytes = 0
                 last_check_bytes = 0
@@ -470,9 +626,12 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
                             )
                             last_check_bytes = total_bytes
                             last_check_time = now
+                reusable = True  # body 已读尽，连接可复用
                 elapsed = time.monotonic() - conn_start
                 if elapsed > 0:
                     log(f"    [完成] {dest.name} 平均速度 {format_speed(total_bytes / elapsed)}")
+            finally:
+                pc.release(reusable)
             if expected_size and part_path.stat().st_size != expected_size:
                 raise IOError(
                     f"大小不符: 期望 {expected_size} B, 实际 {part_path.stat().st_size} B"
@@ -481,6 +640,10 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
             return True
         except StallError as e:
             log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败(看门狗): {e}")
+            if attempt < retries:
+                _sleep_backoff(attempt)
+        except RetryableHTTPError as e:
+            log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败(HTTP {e}): {e}")
             if attempt < retries:
                 _sleep_backoff(attempt)
         except RETRYABLE_EXCEPTIONS as e:
@@ -503,15 +666,14 @@ def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout
     with _chunk_semaphore:
         for attempt in range(1, retries + 1):
             try:
-                req = urllib.request.Request(
-                    quote_url(url),
-                    headers={"User-Agent": UA, "Range": f"bytes={start}-{end}"},
-                )
-                with _open_url(req, timeout=CONNECT_TIMEOUT) as resp:
-                    if resp.getcode() != 206:
-                        raise IOError(f"服务器忽略 Range（HTTP {resp.getcode()}）")
-                    # 读超时收紧到 min(read_timeout, stall_time)：保证“长时间无数据”在 stall-time 内被发现
-                    _set_read_timeout(resp, min(read_timeout, stall_time))
+                pc, resp = fetch_http(quote_url(url), headers={"Range": f"bytes={start}-{end}"},
+                                      read_timeout=min(read_timeout, stall_time))
+                reusable = False
+                try:
+                    if resp.status != 206:
+                        if resp.status in (408, 429) or resp.status >= 500:
+                            raise RetryableHTTPError(f"服务端瞬时错误 HTTP {resp.status}")
+                        raise IOError(f"服务器忽略 Range（HTTP {resp.status}）")
                     rstart = start
                     cr = resp.headers.get("Content-Range", "")
                     m = re.match(r"bytes\s+(\d+)-(\d+)/", cr)
@@ -552,12 +714,19 @@ def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout
                                 )
                                 last_check_bytes = total_bytes
                                 last_check_time = now
-                elapsed = time.monotonic() - conn_start
-                if elapsed > 0:
-                    log(f"      [分片完成] {part_path.name} [{start}-{end}] 平均速度 {format_speed(total_bytes / elapsed)}")
+                    reusable = True  # body 已读尽，连接可复用
+                    elapsed = time.monotonic() - conn_start
+                    if elapsed > 0:
+                        log(f"      [分片完成] {part_path.name} [{start}-{end}] 平均速度 {format_speed(total_bytes / elapsed)}")
+                finally:
+                    pc.release(reusable)
                 return True
             except StallError as e:
                 log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败(看门狗): {e}")
+                if attempt < retries:
+                    _sleep_backoff(attempt)
+            except RetryableHTTPError as e:
+                log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败(HTTP {e}): {e}")
                 if attempt < retries:
                     _sleep_backoff(attempt)
             except RETRYABLE_EXCEPTIONS as e:
@@ -617,8 +786,10 @@ def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, 
 
     failed_any = False
     pending = [c for c in chunk_states if not c["completed"]]
-    while pending and not failed_any:
-        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+    # 线程池在文件级复用（P2-18）：跨轮重试不再反复创建/销毁线程
+    pool = ThreadPoolExecutor(max_workers=min(4, max(1, len(chunks))))
+    try:
+        while pending and not failed_any:
             futures = {
                 pool.submit(download_chunk, url, part_path, c["start"], c["end"], read_timeout, retries, min_speed_kbps, stall_time): c
                 for c in pending
@@ -634,8 +805,10 @@ def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, 
                     c["completed"] = True
                 else:
                     failed_any = True
-        save_chunk_meta(meta_path, meta)
-        pending = [c for c in chunk_states if not c["completed"]]
+            save_chunk_meta(meta_path, meta)
+            pending = [c for c in chunk_states if not c["completed"]]
+    finally:
+        pool.shutdown(wait=True)
 
     if failed_any:
         log(f"    [分片失败] {part_path.name}: 存在重试耗尽的分片，保留 .part 与 .meta 供下次续传")
