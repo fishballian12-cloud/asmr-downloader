@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -32,6 +33,9 @@ DEFAULT_EXCLUDE_EXTS = {"wav", "flac"}
 CHUNK_SIZE = 256 * 1024
 MAX_ACTIVE_CHUNKS = 16
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) asmr-downloader/1.0"
+DEFAULT_MIN_SPEED = 20.0          # 最低平均速度看门狗阈值（KB/s）
+DEFAULT_STALL_TIME = 30.0         # 平均速率低于阈值持续秒数后中断连接触发重试
+WATCHDOG_CHECK_BYTES = 1024 * 1024  # 每写入约 1MB 检查一次平均速率
 
 _print_lock = threading.Lock()
 _state_lock = threading.Lock()
@@ -79,6 +83,10 @@ def setup_network(proxy: str = "") -> None:
         urllib.request.ProxyHandler({"http": proxy, "https": proxy})
     )
     log(f"[代理] 已启用代理: {proxy}")
+
+
+class StallError(Exception):
+    """最低速度看门狗触发的中断信号：平均速率低于阈值且持续超过 stall-time，主动中断连接触发重试。"""
 
 
 def _open_url(req, timeout: int):
@@ -299,22 +307,57 @@ def _set_read_timeout(resp, timeout: int) -> None:
         pass
 
 
-def download_file(url: str, dest: Path, expected_size: int, retries: int) -> bool:
+def format_speed(bytes_per_sec: float) -> str:
+    """字节/秒格式化为可读速度（如 1.2 MB/s / 800.0 KB/s）。"""
+    if bytes_per_sec >= 1024 * 1024:
+        return f"{bytes_per_sec / (1024 * 1024):.1f} MB/s"
+    return f"{bytes_per_sec / 1024:.1f} KB/s"
+
+
+def _enforce_min_speed(total_bytes: int, conn_start: float, stall_started: float | None,
+                       min_speed_bps: float, stall_time: float, now: float) -> float | None:
+    """最低速度看门狗单次检查：平均速率低于阈值且持续超过 stall_time 时抛 StallError。
+
+    - 平均速率 = 累计字节 / 连接开始后耗时（覆盖“连接建立后长时间无任何数据”的窗口）。
+    - 速率恢复后重置 stall 计时。
+    """
+    if conn_start <= 0:
+        return stall_started
+    avg_bps = total_bytes / max(now - conn_start, 1e-9)
+    if avg_bps < min_speed_bps:
+        if stall_started is None:
+            stall_started = now
+        elif now - stall_started >= stall_time:
+            raise StallError(
+                f"下载速度过低 {avg_bps / 1024:.1f} KB/s（阈值 {min_speed_bps / 1024:.1f} KB/s），"
+                f"持续 {now - stall_started:.0f}s >= {stall_time:.0f}s，主动中断连接触发重试"
+            )
+    else:
+        stall_started = None
+    return stall_started
+
+
+def download_file(url: str, dest: Path, expected_size: int, retries: int,
+                  min_speed_kbps: float = DEFAULT_MIN_SPEED,
+                  stall_time: float = DEFAULT_STALL_TIME) -> bool:
     """下载单个文件：支持 Range 时走分片断点续传，否则退化整文件流式下载。"""
     part_path = dest.with_name(dest.name + ".part")
     meta_path = dest.with_name(dest.name + ".part.meta.json")
     read_timeout = read_timeout_for_size(expected_size)
     if expected_size > 0 and probe_range_support(url):
         log(f"    [Range] {dest.name}: 分片下载（{len(plan_chunks(expected_size))} 片）")
-        return download_file_range(url, part_path, meta_path, dest, expected_size, retries, read_timeout)
+        return download_file_range(url, part_path, meta_path, dest, expected_size, retries, read_timeout, min_speed_kbps, stall_time)
     if meta_path.exists():
         # 服务器不支持 Range：清理可能残留的分片 meta，走整文件下载
         meta_path.unlink()
     log(f"    [整文件] {dest.name}: 服务器不支持 Range，流式下载")
-    return download_file_whole(url, part_path, dest, expected_size, retries, read_timeout)
+    return download_file_whole(url, part_path, dest, expected_size, retries, read_timeout, min_speed_kbps, stall_time)
 
 
-def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: int, retries: int, read_timeout: int) -> bool:
+def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: int, retries: int,
+                        read_timeout: int,
+                        min_speed_kbps: float = DEFAULT_MIN_SPEED,
+                        stall_time: float = DEFAULT_STALL_TIME) -> bool:
     """整文件流式下载（Range 退化路径）：先写 .part，成功后原子改名；连接/读超时独立兜底重试。"""
     for attempt in range(1, retries + 1):
         try:
@@ -325,19 +368,39 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
             )
             # 连接阶段独立短超时；连接成功后按文件大小调整读超时
             with _open_url(req, timeout=CONNECT_TIMEOUT) as resp:
-                _set_read_timeout(resp, read_timeout)
+                # 读超时收紧到 min(read_timeout, stall_time)：保证“长时间无数据”在 stall-time 内被发现
+                _set_read_timeout(resp, min(read_timeout, stall_time))
+                conn_start = time.monotonic()
+                total_bytes = 0
+                last_check_bytes = 0
+                last_check_time = conn_start
+                stall_started = None
+                # 读块随 stall_time×min_speed 收缩，保证低速率下检查频率足够（滴流也能按时中断）
+                read_block = min(CHUNK_SIZE, max(32 * 1024, int(stall_time * min_speed_kbps * 1024 / 4)))
                 with open(part_path, "wb") as fh:
                     while True:
                         try:
-                            chunk = resp.read(CHUNK_SIZE)
+                            chunk = resp.read(read_block)
                         except (TimeoutError, socket.timeout) as e:
-                            # 连续无数据超时：本轮视为失败，交由外层重试
-                            raise IOError(
-                                f"读取数据超时（{read_timeout}s 内无数据）: {dest.name}"
+                            # 连续无数据超过 stall-time：最低速度看门狗触发，主动中断重试
+                            raise StallError(
+                                f"连续 {stall_time:.0f}s 无新数据（最低速度看门狗）: {dest.name}"
                             ) from e
                         if not chunk:
                             break
                         fh.write(chunk)
+                        total_bytes += len(chunk)
+                        now = time.monotonic()
+                        if total_bytes - last_check_bytes >= WATCHDOG_CHECK_BYTES or now - last_check_time >= stall_time:
+                            stall_started = _enforce_min_speed(
+                                total_bytes, conn_start, stall_started,
+                                min_speed_kbps * 1024, stall_time, now
+                            )
+                            last_check_bytes = total_bytes
+                            last_check_time = now
+                elapsed = time.monotonic() - conn_start
+                if elapsed > 0:
+                    log(f"    [完成] {dest.name} 平均速度 {format_speed(total_bytes / elapsed)}")
             if expected_size and part_path.stat().st_size != expected_size:
                 raise IOError(
                     f"大小不符: 期望 {expected_size} B, 实际 {part_path.stat().st_size} B"
@@ -351,7 +414,9 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
     return False
 
 
-def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout: int, retries: int) -> bool:
+def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout: int, retries: int,
+                   min_speed_kbps: float = DEFAULT_MIN_SPEED,
+                   stall_time: float = DEFAULT_STALL_TIME) -> bool:
     """用 Range 下载一个分片到 .part 对应偏移；分片内部重试，耗尽后返回 False。
 
     受全局信号量约束，控制总活跃分片数，避免与文件级并发叠加导致连接爆炸。
@@ -366,7 +431,8 @@ def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout
                 with _open_url(req, timeout=CONNECT_TIMEOUT) as resp:
                     if resp.getcode() != 206:
                         raise IOError(f"服务器忽略 Range（HTTP {resp.getcode()}）")
-                    _set_read_timeout(resp, read_timeout)
+                    # 读超时收紧到 min(read_timeout, stall_time)：保证“长时间无数据”在 stall-time 内被发现
+                    _set_read_timeout(resp, min(read_timeout, stall_time))
                     rstart = start
                     cr = resp.headers.get("Content-Range", "")
                     m = re.match(r"bytes\s+(\d+)-(\d+)/", cr)
@@ -374,22 +440,42 @@ def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout
                         rstart = int(m.group(1))
                     if rstart != start:
                         raise IOError(f"Range 响应偏移不符: 请求 {start}, 响应 {rstart}")
+                    conn_start = time.monotonic()
+                    total_bytes = 0
+                    last_check_bytes = 0
+                    last_check_time = conn_start
+                    stall_started = None
+                    # 读块随 stall_time×min_speed 收缩，保证低速率下检查频率足够（滴流也能按时中断）
+                    read_block = min(CHUNK_SIZE, max(32 * 1024, int(stall_time * min_speed_kbps * 1024 / 4)))
                     with open(part_path, "r+b") as fh:
                         fh.seek(rstart)
                         remaining = end - rstart + 1
                         while remaining > 0:
                             try:
-                                chunk = resp.read(min(CHUNK_SIZE, remaining))
+                                chunk = resp.read(min(read_block, remaining))
                             except (TimeoutError, socket.timeout) as e:
-                                raise IOError(
-                                    f"读取分片超时（{read_timeout}s 内无数据）: {part_path.name} [{start}-{end}]"
+                                # 连续无数据超过 stall-time：最低速度看门狗触发，主动中断重试
+                                raise StallError(
+                                    f"连续 {stall_time:.0f}s 无新数据（最低速度看门狗）: {part_path.name} [{start}-{end}]"
                                 ) from e
                             if not chunk:
                                 raise IOError(
                                     f"分片提前结束（连接中断）: {part_path.name} [{start}-{end}]"
                                 )
                             fh.write(chunk)
+                            total_bytes += len(chunk)
                             remaining -= len(chunk)
+                            now = time.monotonic()
+                            if total_bytes - last_check_bytes >= WATCHDOG_CHECK_BYTES or now - last_check_time >= stall_time:
+                                stall_started = _enforce_min_speed(
+                                    total_bytes, conn_start, stall_started,
+                                    min_speed_kbps * 1024, stall_time, now
+                                )
+                                last_check_bytes = total_bytes
+                                last_check_time = now
+                elapsed = time.monotonic() - conn_start
+                if elapsed > 0:
+                    log(f"      [分片完成] {part_path.name} [{start}-{end}] 平均速度 {format_speed(total_bytes / elapsed)}")
                 return True
             except Exception as e:  # noqa: BLE001
                 log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败: {e}")
@@ -398,7 +484,10 @@ def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout
     return False
 
 
-def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, total_size: int, retries: int, read_timeout: int) -> bool:
+def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, total_size: int, retries: int,
+                        read_timeout: int,
+                        min_speed_kbps: float = DEFAULT_MIN_SPEED,
+                        stall_time: float = DEFAULT_STALL_TIME) -> bool:
     """Range 分片下载 + 分片级断点续传。
 
     - .part 按偏移写入各分片；完成状态持久化到 .part.meta.json。
@@ -425,7 +514,7 @@ def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, 
     while pending and not failed_any:
         with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
             futures = {
-                pool.submit(download_chunk, url, part_path, c["start"], c["end"], read_timeout, retries): c
+                pool.submit(download_chunk, url, part_path, c["start"], c["end"], read_timeout, retries, min_speed_kbps, stall_time): c
                 for c in pending
             }
             for fut in as_completed(futures):
@@ -489,6 +578,8 @@ def main() -> int:
     parser.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS, help=f"并发线程数（默认 {DEFAULT_WORKERS}）")
     parser.add_argument("-r", "--retries", type=int, default=DEFAULT_RETRIES, help=f"单文件失败重试次数（默认 {DEFAULT_RETRIES}）")
     parser.add_argument("--proxy", default="", help="代理地址 http://host:port（仅支持 http/https；SOCKS 代理不受支持）")
+    parser.add_argument("--min-speed", type=float, default=DEFAULT_MIN_SPEED, help=f"最低平均速度看门狗阈值 KB/s（默认 {DEFAULT_MIN_SPEED}）")
+    parser.add_argument("--stall-time", type=float, default=DEFAULT_STALL_TIME, help=f"平均速率低于阈值持续秒数后中断连接触发重试（默认 {DEFAULT_STALL_TIME}）")
     args = parser.parse_args()
 
     setup_network(args.proxy)
@@ -558,7 +649,7 @@ def main() -> int:
         if dest.exists() and (not expected or dest.stat().st_size == expected):
             progress.tick("skip")
             return None
-        ok = download_file(node["mediaDownloadUrl"], dest, expected, args.retries)
+        ok = download_file(node["mediaDownloadUrl"], dest, expected, args.retries, args.min_speed, args.stall_time)
         progress.tick("ok" if ok else "fail")
         if not ok:
             return str(dest)
