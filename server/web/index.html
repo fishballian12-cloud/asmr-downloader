@@ -74,7 +74,34 @@
     </section>
   </div>
 
-  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-  <script src="app.js"></script>
+  <script>
+    // Vue3 多源加载：主 CDN 失败自动回退备用 CDN；加载成功后再注入 app.js（保证顺序）
+    (function () {
+      var CDNS = [
+        'https://cdn.bootcdn.net/ajax/libs/vue/3.4.21/vue.global.prod.js',
+        'https://cdn.staticfile.org/vue/3.4.21/vue.global.prod.js',
+        'https://unpkg.com/vue@3/dist/vue.global.prod.js'
+      ];
+      var i = 0;
+      function load() {
+        if (i >= CDNS.length) {
+          console.error('[vue] 所有 CDN 加载失败，请检查网络后刷新');
+          document.getElementById('app').innerHTML =
+            '<p style="padding:20px;color:#c00">Vue 加载失败，请检查网络连接后刷新页面</p>';
+          return;
+        }
+        var s = document.createElement('script');
+        s.src = CDNS[i++];
+        s.onload = function () {
+          var app = document.createElement('script');
+          app.src = 'app.js';
+          document.head.appendChild(app);
+        };
+        s.onerror = load;
+        document.head.appendChild(s);
+      }
+      load();
+    })();
+  </script>
 </body>
 </html>
