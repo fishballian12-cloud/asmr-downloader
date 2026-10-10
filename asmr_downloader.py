@@ -19,6 +19,7 @@ import random
 import re
 import shutil
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -30,6 +31,7 @@ from pathlib import Path
 
 API_BASE = "https://api.asmr-200.com/api"
 DEFAULT_WORKERS = 8
+DEFAULT_GLOBAL_WORKERS = 8  # 进程级全局下载线程上限（所有任务合计，默认 8，可配置）
 DEFAULT_RETRIES = 5
 CONNECT_TIMEOUT = 30
 # 默认音轨策略（无显式 --ext/--exclude-ext 时生效）：
@@ -50,6 +52,17 @@ DISK_SPACE_FACTOR = 1.1           # 磁盘预检冗余系数：预留 1.1 倍文
 _print_lock = threading.Lock()
 _state_lock = threading.Lock()
 _chunk_semaphore = threading.BoundedSemaphore(MAX_ACTIVE_CHUNKS)
+# 进程级全局下载并发信号量：限制所有任务的活跃下载线程总数（默认 8，可用 set_global_workers 调整）
+_global_download_semaphore = threading.BoundedSemaphore(DEFAULT_GLOBAL_WORKERS)
+_global_download_sem_lock = threading.Lock()
+
+
+def set_global_workers(n: int) -> None:
+    """调整进程级全局下载并发上限（重建信号量，对下次任务生效）。"""
+    global _global_download_semaphore
+    n = max(1, int(n))
+    with _global_download_sem_lock:
+        _global_download_semaphore = threading.BoundedSemaphore(n)
 
 # 全局 opener（--proxy 配置后生效）；None 表示使用系统默认（系统代理/直连）
 _global_opener = None
@@ -197,6 +210,17 @@ class _PooledConnection:
             conn = http.client.HTTPConnection(phost, pport, timeout=timeout)
             if scheme == "https":
                 conn.set_tunnel(host, port)
+                # CONNECT 隧道建立后必须做 TLS 包装，否则隧道内仍是明文 HTTP，
+                # 目标 443 端口会拒绝并返回 400 "plain HTTP request was sent to HTTPS port"。
+                _orig_connect = conn.connect
+
+                def _connect_with_tls():
+                    _orig_connect()
+                    if conn.sock is not None:
+                        _ctx = ssl.create_default_context()
+                        conn.sock = _ctx.wrap_socket(conn.sock, server_hostname=host)
+
+                conn.connect = _connect_with_tls
         elif scheme == "https":
             conn = http.client.HTTPSConnection(host, port, timeout=timeout)
         else:
@@ -230,6 +254,9 @@ class _PooledConnection:
         self.pool.release(self, reusable)
 
 
+_POOL_MAX_IDLE = 8  # 每个 (scheme, host, port, proxy) key 最多保留的空闲连接数
+
+
 class ConnectionPool:
     """per-(scheme, host, port, proxy) 连接池，线程安全：获取/归还/失效重建。"""
 
@@ -258,7 +285,17 @@ class ConnectionPool:
             return
         pc.in_use = False
         with self._lock:
+            if len(self._idle) >= _POOL_MAX_IDLE:
+                pc.close()
+                return
             self._idle.append(pc)
+
+    def clear(self) -> None:
+        """清空空闲连接：连接/隧道异常（如代理节点 TLS 重置）后调用，避免复用坏连接。"""
+        with self._lock:
+            while self._idle:
+                pc = self._idle.pop()
+                pc.close()
 
 
 def _parse_proxy_endpoint(proxy: str):
@@ -311,6 +348,12 @@ def fetch_http(url: str, headers: dict = None, method: str = "GET",
         return pc, resp
     except Exception:
         pc.close()
+        # 连接/隧道异常（如代理节点 TLS 重置）后清空同 key 连接池，避免后续复用坏连接
+        _port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        with _pools_lock:
+            pool = _pools.get((parsed.scheme.lower(), parsed.hostname, _port, _global_proxy))
+            if pool is not None:
+                pool.clear()
         raise
 
 
@@ -499,7 +542,13 @@ def select_audio_member(members: list) -> tuple:
         chosen = max(wavs, key=size_of) if wavs else max(flacs, key=size_of)  # wav 优先
         rel_dir, node = chosen
         new_node = dict(node)
-        new_node["mediaDownloadUrl"] = to_m4a_url(node["mediaDownloadUrl"])
+        stream_url = node.get("streamLowQualityUrl")
+        if stream_url:
+            # 源站转码流（fast.kiko /media/stream/*.m4a），已验证可用
+            new_node["mediaDownloadUrl"] = stream_url
+        else:
+            # 兜底：改 download 路径后缀让服务器转码（raw.kiko 常返回 404，仅作兜底）
+            new_node["mediaDownloadUrl"] = to_m4a_url(node["mediaDownloadUrl"])
         new_node["title"] = Path(node["title"]).stem + ".m4a"
         new_node["_m4a"] = True
         return (rel_dir, new_node)
@@ -568,17 +617,20 @@ def probe_remote_size(url: str) -> int:
                               read_timeout=CONNECT_TIMEOUT)
         reusable = False
         try:
-            if resp.status == 206:
-                cr = resp.headers.get("Content-Range", "")
-                m = re.match(r"bytes\s+0-0/(\d+)", cr)
-                resp.read(1)  # 读掉 1 字节 body，连接可干净复用
-                reusable = True
-                if m:
-                    return int(m.group(1))
+            if resp.status in (200, 206):
+                if resp.status == 206:
+                    cr = resp.headers.get("Content-Range", "")
+                    m = re.match(r"bytes\s+0-0/(\d+)", cr)
+                    resp.read(1)  # 读掉 1 字节 body，连接可干净复用
+                    reusable = True
+                    if m:
+                        return int(m.group(1))
+                    return 0
+                cl = resp.headers.get("Content-Length", "")
+                if cl and cl.isdigit():
+                    return int(cl)
                 return 0
-            cl = resp.headers.get("Content-Length", "")
-            if cl and cl.isdigit():
-                return int(cl)
+            # 非 2xx（404/403/5xx 等）：响应体是错误页，Content-Length 不代表文件实际大小
             return 0
         finally:
             pc.release(reusable)
@@ -686,17 +738,24 @@ def _enforce_min_speed(total_bytes: int, conn_start: float, stall_started: float
 def download_file(url: str, dest: Path, expected_size: int, retries: int,
                   min_speed_kbps: float = DEFAULT_MIN_SPEED,
                   stall_time: float = DEFAULT_STALL_TIME,
-                  preallocate: bool = True) -> bool:
+                  preallocate: bool = True) -> tuple:
     """下载单个文件：支持 Range 时走分片断点续传，否则退化整文件流式下载。
 
     expected_size <= 0 时（如 wav/flac 转 m4a，API size 是源文件大小不可信），
     先探测服务端实际大小，再按实际大小规划分片 / 校验 / 续传。
+    返回 (ok: bool, reason: str)，失败时 reason 为具体失败原因（HTTP 状态码 / 异常消息等）。
     """
     part_path = dest.with_name(dest.name + ".part")
     meta_path = dest.with_name(dest.name + ".part.meta.json")
     actual_size = expected_size
     if expected_size <= 0:
-        actual_size = probe_remote_size(url)
+        # 探测可能因 CDN/代理瞬时抖动返回失败，重试最多 3 次
+        for probe_attempt in range(3):
+            actual_size = probe_remote_size(url)
+            if actual_size > 0:
+                break
+            if probe_attempt < 2:
+                time.sleep(1.0)
         if actual_size > 0:
             log(f"    [探测] {dest.name}: 服务端实际大小 {actual_size} B（API size 不可信，以响应为准）")
     read_timeout = read_timeout_for_size(max(actual_size, expected_size))
@@ -714,8 +773,12 @@ def download_file(url: str, dest: Path, expected_size: int, retries: int,
 def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: int, retries: int,
                         read_timeout: int,
                         min_speed_kbps: float = DEFAULT_MIN_SPEED,
-                        stall_time: float = DEFAULT_STALL_TIME) -> bool:
-    """整文件流式下载（Range 退化路径）：先写 .part，成功后原子改名；连接/读超时独立兜底重试。"""
+                        stall_time: float = DEFAULT_STALL_TIME) -> tuple:
+    """整文件流式下载（Range 退化路径）：先写 .part，成功后原子改名；连接/读超时独立兜底重试。
+
+    返回 (ok: bool, reason: str)，失败时 reason 为最后一次失败的异常消息。
+    """
+    last_error = ""
     for attempt in range(1, retries + 1):
         try:
             if part_path.exists():
@@ -724,7 +787,8 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
             reusable = False
             try:
                 if resp.status != 200:
-                    if resp.status in (408, 429) or resp.status >= 500:
+                    # 404/403 多为 CDN 并发限流/回源失败瞬时返回，同 408/429/5xx 一并可重试
+                    if resp.status in (404, 403) or resp.status in (408, 429) or resp.status >= 500:
                         raise RetryableHTTPError(f"服务端瞬时错误 HTTP {resp.status}")
                     raise IOError(f"HTTP {resp.status}")
                 conn_start = time.monotonic()
@@ -766,33 +830,39 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
                     f"大小不符: 期望 {expected_size} B, 实际 {part_path.stat().st_size} B"
                 )
             part_path.replace(dest)
-            return True
+            return True, ""
         except StallError as e:
+            last_error = f"{type(e).__name__}: {e}"
             log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败(看门狗): {e}")
             if attempt < retries:
                 _sleep_backoff(attempt)
         except RetryableHTTPError as e:
+            last_error = f"{type(e).__name__}: {e}"
             log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败(HTTP {e}): {e}")
             if attempt < retries:
                 _sleep_backoff(attempt)
         except RETRYABLE_EXCEPTIONS as e:
+            last_error = f"{type(e).__name__}: {e}"
             log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败: {e}")
             if attempt < retries:
                 _sleep_backoff(attempt)
         except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
             log(f"    [失败] {dest.name} 不可重试错误({type(e).__name__}): {e}")
-            return False
-    return False
+            return False, last_error
+    return False, last_error
 
 
 def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout: int, retries: int,
                    min_speed_kbps: float = DEFAULT_MIN_SPEED,
-                   stall_time: float = DEFAULT_STALL_TIME) -> bool:
+                   stall_time: float = DEFAULT_STALL_TIME) -> tuple:
     """用 Range 下载一个分片到 .part 对应偏移；分片内部重试，耗尽后返回 False。
 
     受全局信号量约束，控制总活跃分片数，避免与文件级并发叠加导致连接爆炸。
+    返回 (ok: bool, reason: str)，失败时 reason 为最后一次失败的异常消息。
     """
     with _chunk_semaphore:
+        last_error = ""
         for attempt in range(1, retries + 1):
             try:
                 pc, resp = fetch_http(quote_url(url), headers={"Range": f"bytes={start}-{end}"},
@@ -800,7 +870,8 @@ def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout
                 reusable = False
                 try:
                     if resp.status != 206:
-                        if resp.status in (408, 429) or resp.status >= 500:
+                        # 404/403 多为 CDN 并发限流/回源失败瞬时返回，同 408/429/5xx 一并可重试
+                        if resp.status in (404, 403) or resp.status in (408, 429) or resp.status >= 500:
                             raise RetryableHTTPError(f"服务端瞬时错误 HTTP {resp.status}")
                         raise IOError(f"服务器忽略 Range（HTTP {resp.status}）")
                     rstart = start
@@ -849,30 +920,34 @@ def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout
                         log(f"      [分片完成] {part_path.name} [{start}-{end}] 平均速度 {format_speed(total_bytes / elapsed)}")
                 finally:
                     pc.release(reusable)
-                return True
+                return True, ""
             except StallError as e:
+                last_error = f"{type(e).__name__}: {e}"
                 log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败(看门狗): {e}")
                 if attempt < retries:
                     _sleep_backoff(attempt)
             except RetryableHTTPError as e:
+                last_error = f"{type(e).__name__}: {e}"
                 log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败(HTTP {e}): {e}")
                 if attempt < retries:
                     _sleep_backoff(attempt)
             except RETRYABLE_EXCEPTIONS as e:
+                last_error = f"{type(e).__name__}: {e}"
                 log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败: {e}")
                 if attempt < retries:
                     _sleep_backoff(attempt)
             except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
                 log(f"      [分片失败] {part_path.name} [{start}-{end}] 不可重试错误({type(e).__name__}): {e}")
-                return False
-    return False
+                return False, last_error
+    return False, last_error
 
 
 def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, total_size: int, retries: int,
                         read_timeout: int,
                         min_speed_kbps: float = DEFAULT_MIN_SPEED,
                         stall_time: float = DEFAULT_STALL_TIME,
-                        preallocate: bool = True) -> bool:
+                        preallocate: bool = True) -> tuple:
     """Range 分片下载 + 分片级断点续传。
 
     - .part 按偏移写入各分片；完成状态持久化到 .part.meta.json。
@@ -914,6 +989,7 @@ def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, 
     chunk_states = meta["chunks"]
 
     failed_any = False
+    last_fail_reason = ""
     pending = [c for c in chunk_states if not c["completed"]]
     # 线程池在文件级复用（P2-18）：跨轮重试不再反复创建/销毁线程
     pool = ThreadPoolExecutor(max_workers=min(4, max(1, len(chunks))))
@@ -926,14 +1002,15 @@ def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, 
             for fut in as_completed(futures):
                 c = futures[fut]
                 try:
-                    ok = fut.result(timeout=30)
+                    ok, reason = fut.result(timeout=30)
                 except Exception as e:  # noqa: BLE001
                     log(f"      [分片线程异常] {part_path.name} [{c['start']}-{c['end']}]: {e}")
-                    ok = False
+                    ok, reason = False, f"分片线程异常: {e}"
                 if ok:
                     c["completed"] = True
                 else:
                     failed_any = True
+                    last_fail_reason = reason or f"分片 [{c['start']}-{c['end']}] 下载失败"
             save_chunk_meta(meta_path, meta)
             pending = [c for c in chunk_states if not c["completed"]]
     finally:
@@ -941,13 +1018,13 @@ def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, 
 
     if failed_any:
         log(f"    [分片失败] {part_path.name}: 存在重试耗尽的分片，保留 .part 与 .meta 供下次续传")
-        return False
+        return False, last_fail_reason
     if part_path.stat().st_size != total_size:
         log(f"    [分片失败] {part_path.name}: 大小校验失败 {part_path.stat().st_size} != {total_size}")
-        return False
+        return False, f"大小校验失败: 期望 {total_size} B, 实际 {part_path.stat().st_size} B"
     part_path.replace(dest)
     meta_path.unlink()
-    return True
+    return True, ""
 
 
 class Progress:
@@ -1113,14 +1190,15 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
                     on_progress("file", {"index": progress.done, "total": progress.total,
                                          "path": str(dest), "ok": True, "skip": True})
                 return None
-            ok = download_file(node["mediaDownloadUrl"], dest, expected, retries, min_speed,
-                               stall_time, preallocate=preallocate)
+            with _global_download_semaphore:
+                ok, reason = download_file(node["mediaDownloadUrl"], dest, expected, retries, min_speed,
+                                           stall_time, preallocate=preallocate)
             progress.tick("ok" if ok else "fail")
             if on_progress:
                 on_progress("file", {"index": progress.done, "total": progress.total,
                                      "path": str(dest), "ok": ok})
             if not ok:
-                return str(dest)
+                return {"path": str(dest), "reason": reason or "下载失败"}
             return None
 
         pool = ThreadPoolExecutor(max_workers=workers)
@@ -1266,7 +1344,10 @@ def main() -> int:
     if summary["fail"]:
         log(f"  失败文件 ({len(summary['failed_files'])}):")
         for f in summary["failed_files"]:
-            log(f"    - {f}")
+            if isinstance(f, dict):
+                log(f"    - {f.get('path')}（{f.get('reason')}）")
+            else:
+                log(f"    - {f}")
     else:
         log("  全部成功。")
     return exit_code

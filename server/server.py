@@ -91,6 +91,14 @@ class TaskStore:
         task.update(fields)
         self.persist()
 
+    def delete(self, task_id: str) -> bool:
+        with self._lock:
+            if task_id not in self.tasks:
+                return False
+            del self.tasks[task_id]
+        self.persist()
+        return True
+
 
 class TaskRunner:
     """任务调度：进程内线程池并发执行 download_work，进度回调更新任务状态并持久化。"""
@@ -184,8 +192,13 @@ class TaskRunner:
             self.store.update(task, status="cancelled", error="已取消",
                               finished_at=now_str(), speed_kbps=0)
         elif stats.get("fail", 0) > 0:
+            failed = stats.get("failed_files", [])
+            detail = "; ".join(
+                f"{Path(f.get('path')).name}: {f.get('reason')}" if isinstance(f, dict) else str(f)
+                for f in failed[:3]
+            ) or "下载失败"
             self.store.update(task, status="failed",
-                              error="; ".join(stats.get("failed_files", [])[:3]) or "下载失败",
+                              error=detail,
                               files_fail=stats.get("fail", 0),
                               finished_at=now_str(), speed_kbps=0)
         else:
@@ -203,6 +216,16 @@ class TaskRunner:
         options = dict(options or {})
         if self.default_output and not options.get("output"):
             options["output"] = self.default_output
+        # 重复任务合并：同 url / 同 rj 的旧任务复用同一条历史记录；运行中/排队中则提示已存在
+        existing = self._find_existing(url)
+        if existing:
+            if existing["status"] in ("running", "queued"):
+                existing["duplicate"] = True
+                return existing
+            # 复用旧记录重跑，保留同一条 id / 历史记录
+            self._reset_for_run(existing, url=url, options=options)
+            self.submit(existing)
+            return existing
         task = {
             "id": uuid.uuid4().hex,
             "url": url,
@@ -227,37 +250,59 @@ class TaskRunner:
         self.submit(task)
         return task
 
+    def _find_existing(self, url: str):
+        """按 url 或 RJ 号查找已有任务（最新优先）。"""
+        rj = ""
+        try:
+            rj = f"RJ{ad.extract_rj_number(url)}"
+        except Exception:  # noqa: BLE001
+            pass
+        for task in reversed(self.store.all()):
+            if rj and task.get("rj") == rj:
+                return task
+            if task.get("url") == url:
+                return task
+        return None
+
+    @staticmethod
+    def _reset_for_run(task: dict, url: str = "", options=None) -> None:
+        """将旧任务记录重置为可重跑状态（保留 id / created_at 等历史字段）。"""
+        if url:
+            task["url"] = url
+        if options is not None:
+            task["options"] = dict(options or {})
+        task["status"] = "queued"
+        task["progress"] = 0.0
+        task["files_total"] = 0
+        task["files_done"] = 0
+        task["files_ok"] = 0
+        task["files_skip"] = 0
+        task["files_fail"] = 0
+        task["speed_kbps"] = 0
+        task["error"] = ""
+        task["started_at"] = ""
+        task["finished_at"] = ""
+        task.pop("cancel_requested", None)
+        task.pop("duplicate", None)
+
     def retry(self, task_id: str) -> bool:
         task = self.store.get(task_id)
         if not task:
             return False
         if task["status"] in ("running", "queued"):
             return False
-        # 复用原配置与 URL，断点续传跳过已完成文件
-        new_id = uuid.uuid4().hex
-        new_task = {
-            "id": new_id,
-            "url": task["url"],
-            "rj": task.get("rj", ""),
-            "title": task.get("title", task["url"]),
-            "status": "queued",
-            "progress": 0.0,
-            "files_total": 0,
-            "files_done": 0,
-            "files_ok": 0,
-            "files_skip": 0,
-            "files_fail": 0,
-            "speed_kbps": 0,
-            "out_dir": task.get("out_dir", ""),
-            "error": "",
-            "options": task.get("options", {}),
-            "created_at": now_str(),
-            "started_at": "",
-            "finished_at": "",
-            "retried_from": task_id,
-        }
-        self.submit(new_task)
+        # 合并回原任务记录（不新建 id）：复用原配置与 URL，断点续传跳过已完成文件
+        self._reset_for_run(task, url=task.get("url", ""), options=task.get("options", {}))
+        self.submit(task)
         return True
+
+    def delete(self, task_id: str) -> bool:
+        task = self.store.get(task_id)
+        if not task:
+            return False
+        if task["status"] in ("running", "queued"):
+            return False
+        return self.store.delete(task_id)
 
     def cancel(self, task_id: str) -> bool:
         task = self.store.get(task_id)
@@ -272,6 +317,22 @@ class TaskRunner:
             self.store.persist()
             return True
         return False
+
+    def clear_done(self) -> int:
+        """批量删除所有已完成（done）任务，返回删除数量；不影响 running/queued。"""
+        deleted = 0
+        for task in self.store.all():
+            if task.get("status") == "done" and self.delete(task["id"]):
+                deleted += 1
+        return deleted
+
+    def retry_failed(self) -> int:
+        """批量重试所有失败（failed）任务，返回重试数量；复用 retry 合并逻辑。"""
+        retried = 0
+        for task in self.store.all():
+            if task.get("status") == "failed" and self.retry(task["id"]):
+                retried += 1
+        return retried
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -353,6 +414,9 @@ class Handler(BaseHTTPRequestHandler):
             options = body.get("options", {})
             tasks = [srv.runner.create(u, options) for u in urls]
             self._send_json(200, {"tasks": tasks})
+        elif path == "/api/tasks/retry-failed":
+            retried = srv.runner.retry_failed()
+            self._send_json(200, {"retried": retried})
         elif path.startswith("/api/tasks/"):
             rest = path[len("/api/tasks/"):]
             parts = rest.split("/")
@@ -376,6 +440,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "未知 API"})
 
 
+    def do_DELETE(self):
+        path = self.path.split("?")[0].rstrip("/") or "/"
+        srv: "Server" = self.server
+        if path == "/api/tasks/clear-done":
+            deleted = srv.runner.clear_done()
+            self._send_json(200, {"deleted": deleted})
+        elif path.startswith("/api/tasks/"):
+            task_id = path[len("/api/tasks/"):]
+            if srv.runner.delete(task_id):
+                self._send_json(200, {"ok": True})
+            else:
+                self._send_json(400, {"error": "任务不存在或当前状态不可删除（运行中/排队中不可删）"})
+        else:
+            self._send_json(404, {"error": "未知 API"})
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -389,9 +469,34 @@ def main() -> int:
     ap.add_argument("--host", default=os.environ.get("ASMR_SERVER_HOST", DEFAULT_HOST))
     ap.add_argument("--port", type=int, default=int(os.environ.get("ASMR_SERVER_PORT", str(DEFAULT_PORT))))
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="并发下载任务数")
+    ap.add_argument("--global-workers", type=int,
+                    default=int(os.environ.get("ASMR_GLOBAL_WORKERS", str(ad.DEFAULT_GLOBAL_WORKERS))),
+                    help="进程级全局下载线程上限（所有任务合计，默认 8）")
+    ap.add_argument("--proxy", default="", help="HTTP/HTTPS 代理地址（默认读 ASMR_PROXY 环境变量，再读系统代理）")
     args = ap.parse_args()
 
+    # 代理初始化：命令行 --proxy > ASMR_PROXY 环境变量 > 系统代理设置
+    # 下载引擎默认直连，若本机需代理才能访问 API（如被墙），Web 端任务会一直卡在超时重试，
+    # 表现为“下载没速度”。因此启动时同步 CLI 的代理配置。
+    proxy = args.proxy or os.environ.get("ASMR_PROXY", "")
+    if not proxy:
+        try:
+            import winreg
+            _k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+            if winreg.QueryValueEx(_k, "ProxyEnable")[0]:
+                proxy = winreg.QueryValueEx(_k, "ProxyServer")[0]
+        except Exception:
+            proxy = ""
+    if proxy and "://" not in proxy:
+        proxy = "http://" + proxy
+    if proxy:
+        ad.setup_network(proxy)
+        print(f"[server] 已启用代理: {proxy}", flush=True)
+
     store = TaskStore(TASKS_JSON)
+    # 全局下载并发上限：限制所有任务合计的活跃下载线程数，避免资源耗尽
+    ad.set_global_workers(args.global_workers)
     runner = TaskRunner(store, workers=args.workers)
     srv = Server((args.host, args.port), runner)
     print(f"[server] ASMR Downloader Web 管理端启动: http://{args.host}:{args.port}", flush=True)

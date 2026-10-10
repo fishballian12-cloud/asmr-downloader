@@ -18,3 +18,6 @@ Desktop.ini
 
 # 日志
 *.log
+
+# 运行时任务数据
+server/tasks.json

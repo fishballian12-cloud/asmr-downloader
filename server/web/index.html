@@ -51,7 +51,12 @@
     </section>
 
     <section class="panel">
-      <h2>历史记录 <span class="count">{{ historyTasks.length }}</span></h2>
+      <h2>历史记录 <span class="count">{{ historyTasks.length }}</span>
+        <span class="actions">
+          <button class="btn small" @click="retryFailed" v-if="failedCount > 0">重试失败 ({{ failedCount }})</button>
+          <button class="btn small danger" @click="clearDone" v-if="doneCount > 0">删除已完成 ({{ doneCount }})</button>
+        </span>
+      </h2>
       <div v-if="historyTasks.length === 0" class="empty">暂无历史记录</div>
       <div v-for="t in historyTasks" :key="t.id" class="task-card done">
         <div class="task-head">
@@ -68,6 +73,7 @@
           <span class="err" v-if="t.error" :title="t.error">错误: {{ shortErr(t.error) }}</span>
           <span class="actions">
             <button class="btn small" @click="retryTask(t.id)" v-if="t.status==='failed' || t.status==='cancelled'">重试</button>
+            <button class="btn small danger" @click="deleteTask(t.id)">删除</button>
           </span>
         </div>
       </div>

@@ -23,6 +23,12 @@ createApp({
     historyTasks() {
       return this.tasks.filter((t) => ["done", "failed", "cancelled"].includes(t.status));
     },
+    doneCount() {
+      return this.tasks.filter((t) => t.status === "done").length;
+    },
+    failedCount() {
+      return this.tasks.filter((t) => t.status === "failed").length;
+    },
   },
   methods: {
     async api(path, method = "GET", body) {
@@ -73,6 +79,38 @@ createApp({
         await this.refresh();
       } catch (e) {
         alert(`取消失败: ${e.message}`);
+      }
+    },
+    async deleteTask(id) {
+      try {
+        await this.api(`/api/tasks/${id}`, "DELETE");
+        await this.refresh();
+      } catch (e) {
+        alert(`删除失败: ${e.message}`);
+      }
+    },
+    async retryFailed() {
+      const n = this.failedCount;
+      if (!n) return;
+      if (!confirm(`确定要重试全部 ${n} 个失败任务吗？`)) return;
+      try {
+        const data = await this.api("/api/tasks/retry-failed", "POST", {});
+        await this.refresh();
+        alert(`已重试 ${data.retried || 0} 个任务`);
+      } catch (e) {
+        alert(`批量重试失败: ${e.message}`);
+      }
+    },
+    async clearDone() {
+      const n = this.doneCount;
+      if (!n) return;
+      if (!confirm(`确定要删除全部 ${n} 个已完成任务吗？此操作不可恢复。`)) return;
+      try {
+        const data = await this.api("/api/tasks/clear-done", "DELETE");
+        await this.refresh();
+        alert(`已删除 ${data.deleted || 0} 个已完成任务`);
+      } catch (e) {
+        alert(`批量删除失败: ${e.message}`);
       }
     },
     statusText(s) {
