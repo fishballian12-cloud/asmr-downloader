@@ -14,7 +14,7 @@
         <button class="tab" :class="{active: view === 'tasks'}" @click="switchView('tasks')">下载管理</button>
         <button class="tab" :class="{active: view === 'library'}" @click="switchView('library')">作品库</button>
       </nav>
-      <span class="conn" :class="{ok: serverOk}">{{ serverOk ? '服务已连接' : '连接中…' }}</span>
+      <span class="conn" :class="{ok: serverOk, fail: serverFail}">{{ connText }}</span>
     </header>
 
     <div v-show="view === 'tasks'">
@@ -43,13 +43,15 @@
         </div>
         <div class="task-sub">{{ t.rj || t.url }} · 速度 {{ fmtSpeed(t.speed_kbps) }}</div>
         <div class="progress">
-          <div class="progress-bar" :style="{width: t.progress + '%'}"></div>
+          <div class="progress-bar" :style="{width: progressPct(t) + '%'}"></div>
         </div>
         <div class="task-meta">
-          进度 {{ t.progress }}% · 文件 {{ t.files_done }}/{{ t.files_total || '?' }}
+          进度 {{ progressPct(t) }}% · 文件 {{ t.files_done }}/{{ t.files_total || '?' }}
           (成功 {{ t.files_ok }} / 跳过 {{ t.files_skip }} / 失败 {{ t.files_fail }})
           <span class="actions">
-            <button class="btn small" @click="cancelTask(t.id)" v-if="t.status==='running'">取消</button>
+            <button class="btn small" @click="cancelTask(t.id)" :disabled="!!cancelling[t.id]" v-if="t.status==='running' || t.status==='queued'" :aria-label="'取消任务 ' + (t.title || t.url)">
+              {{ cancelling[t.id] ? '取消中…' : '取消' }}
+            </button>
           </span>
         </div>
       </div>
@@ -58,8 +60,8 @@
     <section class="panel">
       <h2>历史记录 <span class="count">{{ historyTasks.length }}</span>
         <span class="actions">
-          <button class="btn small" @click="retryFailed" v-if="failedCount > 0">重试失败 ({{ failedCount }})</button>
-          <button class="btn small danger" @click="clearDone" v-if="doneCount > 0">删除已完成 ({{ doneCount }})</button>
+          <button class="btn small" @click="retryFailed" v-if="failedCount > 0" :disabled="retryFailedBusy">{{ retryFailedBusy ? '重试中…' : '重试失败 (' + failedCount + ')' }}</button>
+          <button class="btn small danger" @click="clearDone" v-if="doneCount > 0" :disabled="clearDoneBusy">{{ clearDoneBusy ? '删除中…' : '删除已完成 (' + doneCount + ')' }}</button>
         </span>
       </h2>
       <div v-if="historyTasks.length === 0" class="empty">暂无历史记录</div>
@@ -70,15 +72,17 @@
         </div>
         <div class="task-sub">
           {{ t.rj || t.url }} ·
-          <template v-if="t.finished_at">完成 {{ t.finished_at }}</template>
-          <template v-else>创建 {{ t.created_at }}</template>
+          <template v-if="t.finished_at">完成 {{ fmtTime(t.finished_at) }}</template>
+          <template v-else>创建 {{ fmtTime(t.created_at) }}</template>
         </div>
         <div class="task-meta">
           文件 成功 {{ t.files_ok }} / 跳过 {{ t.files_skip }} / 失败 {{ t.files_fail }}
           <span class="err" v-if="t.error" :title="t.error">错误: {{ shortErr(t.error) }}</span>
           <span class="actions">
-            <button class="btn small" @click="retryTask(t.id)" v-if="t.status==='failed' || t.status==='cancelled'">重试</button>
-            <button class="btn small danger" @click="deleteTask(t.id)">删除</button>
+            <button class="btn small" @click="retryTask(t.id)" v-if="t.status==='failed' || t.status==='cancelled'" :disabled="!!retrying[t.id]" :aria-label="'重试任务 ' + (t.title || t.url)">
+              {{ retrying[t.id] ? '重试中…' : '重试' }}
+            </button>
+            <button class="btn small danger" @click="deleteTask(t.id)" :disabled="!!deleting[t.id]" :aria-label="'删除任务 ' + (t.title || t.url)">{{ deleting[t.id] ? '删除中…' : '删除' }}</button>
           </span>
         </div>
       </div>
@@ -97,7 +101,11 @@
         <div v-if="libraryLoading" class="empty">正在扫描作品库…</div>
         <div v-else-if="works.length === 0" class="empty">暂无已下载作品，完成下载后即可在此查看。</div>
         <div v-else class="work-grid">
-          <div v-for="w in works" :key="w.rj" class="work-card" @click="openWork(w.rj)">
+          <div v-for="w in visibleWorks" :key="w.rj" class="work-card" tabindex="0" role="button"
+               :aria-label="'查看作品 ' + (w.title || w.rj)"
+               @click="openWork(w.rj)"
+               @keydown.enter="openWork(w.rj)"
+               @keydown.space.prevent="openWork(w.rj)">
             <div class="work-cover">
               <img v-if="w.cover_url" :src="w.cover_url" :alt="w.title" loading="lazy">
               <div v-else class="cover-placeholder">无封面</div>
@@ -115,6 +123,9 @@
             </div>
           </div>
         </div>
+        <div class="more-row" v-if="hasMoreWorks">
+          <button class="btn" @click="loadMoreWorks">加载更多作品 ({{ visibleWorks.length }} / {{ works.length }})</button>
+        </div>
       </template>
 
       <template v-else>
@@ -122,6 +133,10 @@
           <button class="btn small" @click="backToLibrary">← 返回作品库</button>
         </section>
         <div v-if="detailLoading" class="empty">正在加载作品详情…</div>
+        <div v-else-if="detailError" class="panel empty err">
+          详情加载失败：{{ detailError }}
+          <span class="actions"><button class="btn small primary" @click="retryOpenWork">重试</button></span>
+        </div>
         <template v-else-if="detail">
           <section class="panel detail-main">
             <div class="detail-cover">
@@ -149,20 +164,26 @@
           <section class="panel">
             <h2>音频 <span class="count">{{ detailGroups.audio.length }}</span></h2>
             <div v-if="detailGroups.audio.length === 0" class="empty">无音频文件</div>
-            <div v-for="(f, i) in detailGroups.audio" :key="f.path" class="file-row">
-              <span class="file-name">{{ i + 1 }}. {{ f.name }}</span>
+            <div v-for="(f, i) in visibleAudio" :key="f.path" class="file-row">
+              <span class="file-name">{{ i + 1 }}. {{ f.rel }}</span>
               <span class="file-size">{{ formatSize(f.size) }}</span>
-              <button class="btn small primary" @click="playAudio(f)">播放</button>
+              <button class="btn small primary" @click="playAudio(f, i)">播放</button>
+            </div>
+            <div class="more-row" v-if="hasMoreAudio">
+              <button class="btn small" @click="loadMoreAudio">加载更多音频 ({{ visibleAudio.length }} / {{ audioList.length }})</button>
             </div>
           </section>
 
           <section class="panel">
             <h2>图片 <span class="count">{{ detailGroups.image.length }}</span></h2>
             <div v-if="detailGroups.image.length === 0" class="empty">无图片文件</div>
-            <div v-for="f in detailGroups.image" :key="f.path" class="file-row">
-              <span class="file-name">{{ f.name }}</span>
+            <div v-for="(f, i) in visibleImage" :key="f.path" class="file-row">
+              <span class="file-name">{{ f.rel }}</span>
               <span class="file-size">{{ formatSize(f.size) }}</span>
-              <button class="btn small" @click="openImage(f)">预览</button>
+              <button class="btn small" @click="openImage(f, i)">预览</button>
+            </div>
+            <div class="more-row" v-if="hasMoreImage">
+              <button class="btn small" @click="loadMoreImage">加载更多图片 ({{ visibleImage.length }} / {{ imageList.length }})</button>
             </div>
           </section>
 
@@ -170,7 +191,7 @@
             <h2>文本 <span class="count">{{ detailGroups.text.length }}</span></h2>
             <div v-if="detailGroups.text.length === 0" class="empty">无文本文件</div>
             <div v-for="f in detailGroups.text" :key="f.path" class="file-row">
-              <span class="file-name">{{ f.name }}</span>
+              <span class="file-name">{{ f.rel }}</span>
               <span class="file-size">{{ formatSize(f.size) }}</span>
               <button class="btn small" @click="openText(f)">查看</button>
             </div>
@@ -179,7 +200,7 @@
           <section class="panel" v-if="detailGroups.other.length">
             <h2>其他 <span class="count">{{ detailGroups.other.length }}</span></h2>
             <div v-for="f in detailGroups.other" :key="f.path" class="file-row">
-              <span class="file-name">{{ f.name }}</span>
+              <span class="file-name">{{ f.rel }}</span>
               <span class="file-size">{{ formatSize(f.size) }}</span>
             </div>
           </section>
@@ -189,25 +210,43 @@
 
     <!-- 音频播放器 -->
     <div v-if="currentAudio" class="player-bar">
-      <audio :src="currentAudio" controls autoplay></audio>
+      <button class="btn small" :disabled="audioIndex <= 0" @click="prevAudio">上一首</button>
+      <div class="player-info">
+        <span class="player-pos">{{ audioIndex + 1 }} / {{ audioList.length }}</span>
+        <span class="player-name" :title="currentAudioName">{{ currentAudioName }}</span>
+      </div>
+      <audio ref="playerAudio" :src="currentAudio" controls autoplay @ended="onAudioEnded" @error="onAudioError"></audio>
+      <button class="btn small" :disabled="audioIndex >= audioList.length - 1" @click="nextAudio">下一首</button>
       <button class="btn small" @click="currentAudio = ''">停止</button>
     </div>
 
     <!-- 图片预览弹层 -->
-    <div v-if="previewImage" class="lightbox" @click.self="previewImage = ''">
-      <img :src="previewImage" alt="预览">
-      <button class="btn small lightbox-close" @click="previewImage = ''">关闭</button>
+    <div v-if="previewImage" class="lightbox" @click.self="closeImage" role="dialog" aria-label="图片预览">
+      <span v-if="imageLoading" class="lightbox-status">图片加载中…</span>
+      <span v-else-if="imageError" class="lightbox-status err">图片加载失败，文件可能缺失</span>
+      <img v-show="!imageLoading && !imageError" :src="previewImage" alt="预览" @load="onImageLoaded" @error="onImageError">
+      <button class="btn small lightbox-close" @click="closeImage">关闭</button>
+      <button class="btn small lightbox-prev" :disabled="imageIndex <= 0" @click="prevImage">‹ 上一张</button>
+      <button class="btn small lightbox-next" :disabled="imageIndex >= imageList.length - 1" @click="nextImage">下一张 ›</button>
+      <span class="lightbox-count">{{ imageIndex + 1 }} / {{ imageList.length }}</span>
     </div>
 
     <!-- 文本查看弹层 -->
-    <div v-if="previewText" class="lightbox" @click.self="previewText = ''">
+    <div v-if="previewText" class="lightbox" @click.self="closeText" role="dialog" aria-label="文本预览">
       <div class="text-viewer">
         <div class="text-viewer-head">
           <strong>{{ previewTextName }}</strong>
-          <button class="btn small" @click="previewText = ''">关闭</button>
+          <button class="btn small" @click="closeText">关闭</button>
         </div>
-        <pre>{{ previewText }}</pre>
+        <div v-if="textLoading" class="text-loading">正在加载…</div>
+        <pre v-else>{{ previewText }}</pre>
+        <div v-if="textTruncated" class="text-truncated">文件较大，已截断前 200000 字符展示</div>
       </div>
+    </div>
+
+    <!-- Toast 通知 -->
+    <div class="toast-wrap" aria-live="polite">
+      <div v-for="t in toasts" :key="t.id" class="toast" :class="t.type">{{ t.msg }}</div>
     </div>
   </div>
 
