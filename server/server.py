@@ -17,6 +17,7 @@ import mimetypes
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -30,6 +31,86 @@ from urllib.parse import quote, unquote
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import asmr_downloader as ad  # noqa: E402
+
+# --- Windows Job Object：server 退出（含被强杀）时级联终止全部下载子进程，避免孤儿化 ---
+# Windows 无父子进程自动级联终止；把 server 自身与下载子进程纳入同一个 KILL_ON_JOB_CLOSE
+# 作业对象，Job 句柄随 server 进程终止被系统关闭时，作业内所有进程一并被终止。
+_JOB_HANDLE = None
+try:
+    import ctypes
+    from ctypes import wintypes
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    JobObjectExtendedLimitInformation = 9
+    _kernel32 = ctypes.windll.kernel32
+
+    def _init_job_object():
+        """创建 KILL_ON_JOB_CLOSE 作业对象并把当前进程纳入；句柄存模块级避免被 GC。"""
+        global _JOB_HANDLE
+        if _JOB_HANDLE is not None:
+            return _JOB_HANDLE
+        job = _kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not _kernel32.SetInformationJobObject(
+                job, JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)):
+            _kernel32.CloseHandle(job)
+            return None
+        # 当前进程可能已被父进程放进其它 Job（嵌套受限），失败不致命：子进程仍可单独 assign
+        _kernel32.AssignProcessToJobObject(job, _kernel32.GetCurrentProcess())
+        _JOB_HANDLE = job
+        return job
+
+    def _join_job(proc):
+        """把下载子进程纳入 Job（父进程已在 Job 时子进程自动继承，此处为兜底）。"""
+        if _JOB_HANDLE is None:
+            return
+        try:
+            _kernel32.AssignProcessToJobObject(_JOB_HANDLE, int(proc._handle))
+        except Exception:  # noqa: BLE001 已关联/句柄异常均忽略
+            pass
+except Exception:  # noqa: BLE001 非 Windows 或 ctypes 不可用：退化为原行为（无级联终止）
+    def _init_job_object():
+        return None
+
+    def _join_job(proc):
+        return None
+
 
 SERVER_DIR = Path(__file__).resolve().parent
 WEB_DIR = SERVER_DIR / "web"
@@ -256,17 +337,22 @@ def build_work_summary(work_dir: Path) -> dict:
 
 
 def list_work_files(work_dir: Path) -> list:
-    """递归列出作品目录内文件（排除 meta.json / cover.jpg），按类型分组。"""
+    """递归列出作品目录内文件（排除 meta.json / cover.jpg），按类型分组。
+
+    rel 为作品目录内相对路径（前端展示与排序用，如 音声/SEあり/track1.m4a）；
+    path 带作品目录名前缀的完整相对路径（前端 workFileUrl 直接拼 /files/ 访问）。
+    """
     files = []
-    for p in sorted(work_dir.rglob("*"), key=lambda x: x.name.lower()):
+    for p in sorted(work_dir.rglob("*"), key=lambda x: x.relative_to(work_dir).as_posix().lower()):
         if not p.is_file():
             continue
         if p.name in (META_JSON, COVER_JPG):
             continue
-        rel = str(p.relative_to(work_dir))
+        rel = p.relative_to(work_dir).as_posix()
         files.append({
             # 带作品目录名前缀的完整相对路径，前端 workFileUrl 直接拼 /files/ 即可访问
-            "path": f"{work_dir.name}/{rel.replace(chr(92), '/')}",
+            "path": f"{work_dir.name}/{rel}",
+            "rel": rel,
             "name": p.name,
             "size": p.stat().st_size,
             "type": classify_file_ext(p.name),
@@ -342,14 +428,22 @@ class TaskStore:
 
 
 class TaskRunner:
-    """任务调度：进程内线程池并发执行 download_work，进度回调更新任务状态并持久化。"""
+    """任务调度：线程池并发管理下载子进程（每个任务一个独立 python 子进程执行 CLI 下载）。
 
-    def __init__(self, store: TaskStore, workers: int = DEFAULT_WORKERS, default_output: str = ""):
+    进度通过子进程 stdout 的 ##JSON## 机器行回传解析；取消直接 terminate/kill 子进程；
+    重启后 running 任务经 TaskStore 恢复为 queued 重新入队（无对应子进程）。
+    """
+
+    def __init__(self, store: TaskStore, workers: int = DEFAULT_WORKERS,
+                 default_output: str = "", proxy: str = ""):
         self.store = store
         self.default_output = default_output
+        self.proxy = proxy
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dl-task")
-        self._active = set()      # 当前有下载线程的任务 id（进程内）
+        self._active = set()      # 当前有监控线程的任务 id
         self._active_lock = threading.Lock()
+        self._procs = {}          # task_id -> subprocess.Popen（运行中下载子进程）
+        self._procs_lock = threading.Lock()
         # 服务重启恢复：把磁盘中 queued 任务（含由 running 恢复来的）重新入队
         for task in self.store.all():
             if task.get("status") == "queued":
@@ -369,6 +463,79 @@ class TaskRunner:
             with self._active_lock:
                 self._active.discard(task_id)
 
+    def _build_cmd(self, task: dict) -> list:
+        """构建下载 CLI 子进程命令行（server 侧默认输出目录保持 cwd/download）。"""
+        script = Path(__file__).resolve().parent.parent / "asmr_downloader.py"
+        opts = task.get("options", {})
+        cmd = [sys.executable, str(script), task.get("url", ""),
+               "-o", opts.get("output", "") or str(Path(os.getcwd()) / "download"),
+               "-w", str(int(opts.get("workers", ad.DEFAULT_WORKERS))),
+               "-r", str(int(opts.get("retries", ad.DEFAULT_RETRIES))),
+               "--min-speed", str(float(opts.get("min_speed", ad.DEFAULT_MIN_SPEED))),
+               "--stall-time", str(float(opts.get("stall_time", ad.DEFAULT_STALL_TIME))),
+               "--json-progress"]
+        if self.proxy:
+            cmd += ["--proxy", self.proxy]
+        if opts.get("types"):
+            cmd += ["--types", str(opts["types"])]
+        if opts.get("ext"):
+            cmd += ["--ext", str(opts["ext"])]
+        if opts.get("exclude_ext"):
+            cmd += ["--exclude-ext", str(opts["exclude_ext"])]
+        if opts.get("include_regex"):
+            cmd += ["--include-regex", str(opts["include_regex"])]
+        if opts.get("exclude_regex"):
+            cmd += ["--exclude-regex", str(opts["exclude_regex"])]
+        if not bool(opts.get("preallocate", True)):
+            cmd += ["--no-preallocate"]
+        return cmd
+
+    @staticmethod
+    def _fail_detail(stats: dict, stderr_lines) -> str:
+        """从子进程统计/错误输出构造失败详情（优先 failed_files，其次 stderr 尾部）。"""
+        failed = stats.get("failed_files", []) or []
+        detail = "; ".join(
+            f"{Path(f.get('path')).name}: {f.get('reason')}" if isinstance(f, dict) else str(f)
+            for f in failed[:3]
+        )
+        if not detail and stderr_lines:
+            detail = " | ".join(str(x) for x in stderr_lines[-3:])
+        return detail or "下载失败"
+
+    def _apply_progress(self, task: dict, stage: str, data: dict, state: dict) -> None:
+        """子进程进度行更新任务状态（等价原进程内 on_progress，取消由 cancel() 直接杀进程）。"""
+        if stage == "meta":
+            self.store.update(task, rj=data.get("rj", task.get("rj", "")),
+                              title=data.get("title", task.get("title", "")))
+        elif stage == "filter":
+            selected = data.get("selected", 0)
+            self.store.update(task, files_total=selected, files_done=0,
+                              files_ok=0, files_skip=0, files_fail=0, progress=0.0)
+        elif stage == "file":
+            # 优先采用子进程上报的 total（manifest 续传路径不发 filter，files_total 已被清零）
+            files_total = data.get("total") or max(task.get("files_total", 0), 1)
+            done = data.get("index", 0)
+            ok = data.get("ok", False)
+            skip = bool(data.get("skip", False))
+            files_ok = task.get("files_ok", 0) + (1 if ok and not skip else 0)
+            files_skip = task.get("files_skip", 0) + (1 if skip else 0)
+            files_fail = task.get("files_fail", 0) + (0 if ok else 1)
+            # 速度：以已完成文件大小 / 耗时估算（文件级粒度）
+            try:
+                size = os.path.getsize(data["path"])
+                state["bytes_done"][0] += size
+            except OSError:
+                pass
+            elapsed = max(time.monotonic() - state["start_wall"], 0.01)
+            self.store.update(
+                task, files_done=done, files_ok=files_ok, files_skip=files_skip,
+                files_fail=files_fail, files_total=files_total,
+                progress=round(done / files_total * 100, 1),
+                speed_kbps=round(state["bytes_done"][0] / elapsed / 1024, 1),
+            )
+        elif stage == "done":
+            self.store.persist()
+
     def _run_inner(self, task_id: str) -> None:
         task = self.store.get(task_id)
         if not task:
@@ -383,100 +550,111 @@ class TaskRunner:
         task["error"] = ""
         task["cancel_requested"] = False
         self.store.persist()
-        start_wall = time.monotonic()
-        bytes_done = [0]
 
-        def on_progress(stage, data):
-            if task["cancel_requested"]:
-                raise CancelRequested("用户取消")
-            if stage == "meta":
-                self.store.update(task, rj=data.get("rj", task.get("rj", "")),
-                                  title=data.get("title", task.get("title", "")))
-            elif stage == "filter":
-                selected = data.get("selected", 0)
-                self.store.update(task, files_total=selected, files_done=0,
-                                  files_ok=0, files_skip=0, files_fail=0, progress=0.0)
-            elif stage == "file":
-                files_total = max(task.get("files_total", 0), 1)
-                done = data.get("index", 0)
-                ok = data.get("ok", False)
-                skip = bool(data.get("skip", False))
-                files_ok = task.get("files_ok", 0) + (1 if ok and not skip else 0)
-                files_skip = task.get("files_skip", 0) + (1 if skip else 0)
-                files_fail = task.get("files_fail", 0) + (0 if ok else 1)
-                # 速度：以已完成文件大小 / 耗时估算（文件级粒度）
-                try:
-                    size = os.path.getsize(data["path"])
-                    bytes_done[0] += size
-                except OSError:
-                    pass
-                elapsed = max(time.monotonic() - start_wall, 0.01)
-                self.store.update(
-                    task, files_done=done, files_ok=files_ok, files_skip=files_skip,
-                    files_fail=files_fail,
-                    progress=round(done / files_total * 100, 1),
-                    speed_kbps=round(bytes_done[0] / elapsed / 1024, 1),
-                )
-            elif stage == "done":
-                self.store.persist()
-
-        opts = task.get("options", {})
+        state = {"start_wall": time.monotonic(), "bytes_done": [0],
+                 "final_stats": None, "stderr_lines": []}
+        cmd = self._build_cmd(task)
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
         try:
-            stats = ad.download_work(
-                task.get("url", ""),
-                output_dir=opts.get("output", "") or str(Path(os.getcwd()) / "download"),
-                types=opts.get("types", ""),
-                exts=opts.get("ext", ""),
-                exclude_exts=opts.get("exclude_ext", ""),
-                include_regex=opts.get("include_regex", ""),
-                exclude_regex=opts.get("exclude_regex", ""),
-                workers=int(opts.get("workers", ad.DEFAULT_WORKERS)),
-                retries=int(opts.get("retries", ad.DEFAULT_RETRIES)),
-                min_speed=float(opts.get("min_speed", ad.DEFAULT_MIN_SPEED)),
-                stall_time=float(opts.get("stall_time", ad.DEFAULT_STALL_TIME)),
-                preallocate=bool(opts.get("preallocate", True)),
-                on_progress=on_progress,
-                cancel_cb=lambda: task.get("cancel_requested", False),
+            proc = subprocess.Popen(
+                cmd, cwd=str(Path(__file__).resolve().parent.parent),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                bufsize=1, env=env,
             )
-        except ad.DownloadCancelled as e:
-            self.store.update(task, status="cancelled", error=f"已取消: {e}",
+        except OSError as e:
+            self.store.update(task, status="failed", error=f"启动下载进程失败: {e}",
                               finished_at=now_str(), speed_kbps=0)
             self.store.persist()
             return
-        except CancelRequested as e:
-            self.store.update(task, status="cancelled", error=f"已取消: {e}",
-                              finished_at=now_str(), speed_kbps=0)
-            self.store.persist()
-            return
-        except Exception as e:  # noqa: BLE001
-            self.store.update(task, status="failed", error=f"{type(e).__name__}: {e}",
-                              finished_at=now_str(), speed_kbps=0)
-            self.store.persist()
-            return
+        with self._procs_lock:
+            self._procs[task_id] = proc
+        _join_job(proc)  # 纳入 Job Object：server 退出时级联终止本子进程
 
-        err = stats.get("error", "")
-        if err and err.startswith("CancelRequested"):
+        def _read_stdout():
+            """解析子进程 stdout 的 ##JSON## 进度行并更新任务状态（取消后不再更新）。"""
+            try:
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line.startswith("##JSON##"):
+                        continue
+                    try:
+                        payload = json.loads(line[len("##JSON##"):])
+                    except json.JSONDecodeError:
+                        continue
+                    if payload.get("event") != "progress":
+                        continue
+                    stage = payload.get("stage", "")
+                    data = payload.get("data") or {}
+                    if task.get("cancel_requested"):
+                        continue
+                    if stage == "done":
+                        stats = dict(data.get("stats") or {})
+                        stats.setdefault("rj", data.get("rj", ""))
+                        state["final_stats"] = stats
+                    self._apply_progress(task, stage, data, state)
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                try:
+                    proc.stdout.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def _read_stderr():
+            """收集子进程 stderr 尾部，失败时用于错误描述。"""
+            try:
+                for line in proc.stderr:
+                    state["stderr_lines"].append(line.rstrip("\n"))
+                    if len(state["stderr_lines"]) > 60:
+                        state["stderr_lines"] = state["stderr_lines"][-60:]
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                try:
+                    proc.stderr.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        out_t = threading.Thread(target=_read_stdout, daemon=True, name=f"dl-out-{task_id[:8]}")
+        err_t = threading.Thread(target=_read_stderr, daemon=True, name=f"dl-err-{task_id[:8]}")
+        out_t.start()
+        err_t.start()
+        try:
+            rc = proc.wait()
+        finally:
+            with self._procs_lock:
+                self._procs.pop(task_id, None)
+            for t in (out_t, err_t):
+                t.join(timeout=5.0)
+
+        # 取消：cancel() 已直接置 cancelled 并杀进程，这里兜底标记（幂等）
+        if task.get("cancel_requested"):
             self.store.update(task, status="cancelled", error="已取消",
                               finished_at=now_str(), speed_kbps=0)
-        elif stats.get("fail", 0) > 0:
-            failed = stats.get("failed_files", [])
-            detail = "; ".join(
-                f"{Path(f.get('path')).name}: {f.get('reason')}" if isinstance(f, dict) else str(f)
-                for f in failed[:3]
-            ) or "下载失败"
+            self.store.persist()
+            return
+
+        stats = state["final_stats"] or {}
+        if rc != 0:
+            err = str(stats.get("error", ""))
+            if not err:
+                err = self._fail_detail(stats, state["stderr_lines"])
             self.store.update(task, status="failed",
-                              error=detail,
+                              error=err,
                               files_fail=stats.get("fail", 0),
                               finished_at=now_str(), speed_kbps=0)
-        else:
-            self.store.update(task, status="done",
-                              files_total=stats.get("total", 0),
-                              files_done=stats.get("total", 0),
-                              files_ok=stats.get("success", 0),
-                              files_skip=stats.get("skip", 0),
-                              files_fail=0, progress=100.0,
-                              out_dir=stats.get("out_dir", ""),
-                              finished_at=now_str(), speed_kbps=0)
+            self.store.persist()
+            return
+
+        self.store.update(task, status="done",
+                          files_total=stats.get("total", 0),
+                          files_done=stats.get("total", 0),
+                          files_ok=stats.get("success", 0),
+                          files_skip=stats.get("skip", 0),
+                          files_fail=0, progress=100.0,
+                          out_dir=stats.get("out_dir", ""),
+                          finished_at=now_str(), speed_kbps=0)
         self.store.persist()
 
     def create(self, url: str, options: dict) -> dict:
@@ -580,20 +758,29 @@ class TaskRunner:
                               finished_at=now_str())
             return True
         if task["status"] == "running":
-            with self._active_lock:
-                has_thread = task_id in self._active
-            if not has_thread:
-                # 无对应下载线程（如磁盘恢复残留的 running 幽灵状态）：直接置为已取消
-                self.store.update(task, status="cancelled", error="已取消（无运行线程）",
-                                  finished_at=now_str(), speed_kbps=0)
-                return True
+            with self._procs_lock:
+                proc = self._procs.get(task_id)
             task["cancel_requested"] = True
             self.store.persist()
-            # 立即关闭引擎全部连接（含正在阻塞 recv 的），使下载线程尽快收到读异常退出
-            try:
-                ad.force_close_connections()
-            except Exception:
-                pass
+            if proc is not None and proc.poll() is None:
+                # 直接终止下载子进程（Windows 下 terminate 即 TerminateProcess）
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                self.store.update(task, status="cancelled", error="已取消",
+                                  finished_at=now_str(), speed_kbps=0)
+                return True
+            # 无对应下载子进程（如磁盘恢复残留的 running 幽灵状态）：直接置为已取消
+            self.store.update(task, status="cancelled", error="已取消（无运行进程）",
+                              finished_at=now_str(), speed_kbps=0)
             return True
         return False
 
@@ -854,6 +1041,9 @@ def main() -> int:
     ap.add_argument("--proxy", default="", help="HTTP/HTTPS 代理地址（默认读 ASMR_PROXY 环境变量，再读系统代理）")
     args = ap.parse_args()
 
+    # 级联终止作业对象：确保本进程被强杀时下载子进程一并退出，不留孤儿
+    _init_job_object()
+
     # 内建文件日志：控制台 + server.log 双写（UTF-8 追加），覆盖引擎 ad.log 与各任务线程输出
     log_path = install_file_logging()
     print(f"[server] 日志双写: {log_path}", flush=True)
@@ -880,7 +1070,7 @@ def main() -> int:
     store = TaskStore(TASKS_JSON)
     # 全局下载并发上限：限制所有任务合计的活跃下载线程数，避免资源耗尽
     ad.set_global_workers(args.global_workers)
-    runner = TaskRunner(store, workers=args.workers)
+    runner = TaskRunner(store, workers=args.workers, proxy=proxy)
     srv = Server((args.host, args.port), runner)
     print(f"[server] ASMR Downloader Web 管理端启动: http://{args.host}:{args.port}", flush=True)
     print(f"[server] 任务持久化: {TASKS_JSON}", flush=True)
