@@ -175,7 +175,20 @@ RETRYABLE_EXCEPTIONS = (
 
 def _is_retryable(exc: BaseException) -> bool:
     """判断异常是否属于可重试的网络类错误（含看门狗/服务端瞬时错误）。"""
-    return isinstance(exc, RETRYABLE_EXCEPTIONS) or isinstance(exc, (StallError, RetryableHTTPError))
+    return (isinstance(exc, RETRYABLE_EXCEPTIONS)
+            or isinstance(exc, (StallError, RetryableHTTPError))
+            or _is_timed_out_oserror(exc))
+
+
+def _is_timed_out_oserror(exc: BaseException) -> bool:
+    """判断是否为 http.client 读超时后再次读取触发的普通 OSError。
+
+    典型消息 "cannot read from timed out object"：底层 socket 读超时后响应对象
+    已失效，再 read 抛出不带 errno 的普通 OSError，不在 RETRYABLE_EXCEPTIONS
+    集合内。通过消息特征识别为可重试网络错误；磁盘满（ENOSPC）等本地 IO 错误
+    不含 "timed out" 消息，仍不可重试。
+    """
+    return isinstance(exc, OSError) and "timed out" in str(exc)
 
 
 # socket 读超时轮询间隔：单次 recv 等待上限压缩到此值，超时后先查取消再继续，
@@ -929,6 +942,18 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
             log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败: {e}")
             if attempt < retries:
                 _sleep_backoff(attempt, cancel_cb)
+        except OSError as e:
+            if _is_timed_out_oserror(e):
+                # http.client 读超时后再次 read 的普通 OSError：视为可重试网络错误
+                last_error = f"{type(e).__name__}: {e}"
+                log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败(读超时): {e}")
+                if attempt < retries:
+                    _sleep_backoff(attempt, cancel_cb)
+            else:
+                # 磁盘满等本地 IO 错误仍不可重试
+                last_error = f"{type(e).__name__}: {e}"
+                log(f"    [失败] {dest.name} 不可重试错误(OSError): {e}")
+                return False, last_error
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
             log(f"    [失败] {dest.name} 不可重试错误({type(e).__name__}): {e}")
@@ -1059,6 +1084,19 @@ def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout
                 log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败: {e}")
                 if attempt < retries:
                     _sleep_backoff(attempt, cancel_cb)
+            except OSError as e:
+                if _is_timed_out_oserror(e):
+                    # http.client 读超时后再次 read 的普通 OSError：视为可重试网络错误，
+                    # offset 已累计已写入字节，重试从 start+offset 继续（断点续传）
+                    last_error = f"{type(e).__name__}: {e}"
+                    log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败(读超时): {e}")
+                    if attempt < retries:
+                        _sleep_backoff(attempt, cancel_cb)
+                else:
+                    # 磁盘满等本地 IO 错误仍不可重试
+                    last_error = f"{type(e).__name__}: {e}"
+                    log(f"      [分片失败] {part_path.name} [{start}-{end}] 不可重试错误(OSError): {e}")
+                    return False, last_error
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"
                 log(f"      [分片失败] {part_path.name} [{start}-{end}] 不可重试错误({type(e).__name__}): {e}")
@@ -1274,6 +1312,88 @@ def _save_meta_and_cover(out_dir: Path, work_info: object) -> None:
                 log("    [封面] 下载失败（忽略，不影响下载）")
 
 
+MANIFEST_VERSION = 1
+MANIFEST_FILENAME = "manifest.json"
+
+
+def _save_manifest(out_dir: Path, rj: str, title: str, selected: list) -> Path:
+    """把下载计划（文件相对路径 + URL + 预期大小）持久化为作品目录 manifest.json。
+
+    复用续传时跳过 workInfo/tracks API；m4a 转码项记录原始 size，下载时以 _m4a
+    标志忽略大小校验（与 worker 现有逻辑一致）。写入失败仅告警，不阻塞下载。
+    """
+    files = []
+    for rel_dir, node in selected:
+        rel = rel_dir.as_posix() if isinstance(rel_dir, Path) else str(rel_dir)
+        files.append({
+            "rel_dir": rel,
+            "title": node.get("title") or "untitled",
+            "url": node.get("mediaDownloadUrl", ""),
+            "size": int(node.get("size") or 0),
+            "m4a": bool(node.get("_m4a", False)),
+        })
+    manifest = {
+        "version": MANIFEST_VERSION,
+        "rj": rj,
+        "title": title,
+        "files": files,
+    }
+    path = out_dir / MANIFEST_FILENAME
+    try:
+        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        log(f"    [manifest] 已保存下载计划 {MANIFEST_FILENAME}（{len(files)} 个文件）")
+    except Exception as e:  # noqa: BLE001
+        log(f"    [manifest] 写入 {MANIFEST_FILENAME} 失败（不阻塞）: {e}")
+    return path
+
+
+def _load_manifest(output_base: str, rj_digits: str):
+    """在输出根目录下查找 RJ 对应作品目录的 manifest.json，返回 (manifest, out_dir)。
+
+    目录名格式 RJ{digits}_{title}（与下载时 folder_name 一致）；多个候选时取目录
+    修改时间最新者，避免旧版本干扰。manifest 无效（version/rj/files 缺失或不符）
+    时返回 (None, None)。
+    """
+    try:
+        base = Path(output_base)
+        candidates = []
+        for d in base.glob(f"RJ{rj_digits}_*"):
+            if not d.is_dir():
+                continue
+            mp = d / MANIFEST_FILENAME
+            if not mp.is_file():
+                continue
+            try:
+                data = json.loads(mp.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            if (isinstance(data, dict) and data.get("version") == MANIFEST_VERSION
+                    and data.get("rj") == f"RJ{rj_digits}"
+                    and isinstance(data.get("files"), list)):
+                candidates.append((d.stat().st_mtime, data, d))
+        if not candidates:
+            return None, None
+        _, data, d = max(candidates, key=lambda t: t[0])
+        return data, d
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _selected_from_manifest(manifest: dict) -> list:
+    """把 manifest 文件条目还原为 (rel_dir, node) 下载列表（与解析流程同构）。"""
+    selected = []
+    for f in manifest.get("files") or []:
+        rel_dir = f.get("rel_dir") or ""
+        node = {
+            "title": f.get("title") or "untitled",
+            "mediaDownloadUrl": f.get("url", ""),
+            "size": int(f.get("size") or 0),
+            "_m4a": bool(f.get("m4a", False)),
+        }
+        selected.append((Path(rel_dir) if rel_dir else Path(""), node))
+    return selected
+
+
 def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: str = "",
                   exclude_exts: str = "", include_regex: str = "", exclude_regex: str = "",
                   workers: int = DEFAULT_WORKERS, retries: int = DEFAULT_RETRIES,
@@ -1311,18 +1431,156 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
             except Exception as e:  # noqa: BLE001
                 raise DownloadCancelled("用户取消") from e
 
+    def _use_manifest(manifest_data: dict, manifest_out_dir: Path, *, via_api_fallback: bool):
+        """从本地 manifest 恢复下载计划：构造待下载列表并判断是否全部完成。
+
+        返回 (pending, out_dir)；pending 为待续传的 [(rel_dir, node), ...]，
+        全部完成时 pending 为 None（此时已汇报 done 并可直接 return stats）。
+        """
+        title = manifest_data.get("title") or "unknown_title"
+        stats["title"] = title
+        _emit_progress("meta", {"rj": stats["rj"], "title": title})
+        out_dir = manifest_out_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stats["out_dir"] = str(out_dir)
+        if via_api_fallback:
+            log(f"[2/4] 改用本地 manifest 兜底续传: {out_dir / MANIFEST_FILENAME}")
+        else:
+            log(f"[2/4] 复用本地 manifest（跳过 workInfo API）: {out_dir / MANIFEST_FILENAME}")
+        log(f"      作品: {title}")
+        selected = _selected_from_manifest(manifest_data)
+        pending = []
+        for rel_dir, node in selected:
+            dest = out_dir / rel_dir / sanitize_filename(node.get("title") or "untitled")
+            expected = 0 if node.get("_m4a") else int(node.get("size") or 0)
+            if not (dest.exists() and dest.stat().st_size > 0
+                    and (not expected or dest.stat().st_size == expected)):
+                pending.append((rel_dir, node))
+        if not pending:
+            log("本地 manifest 文件均已下载完成，无需续传。")
+            stats["total"] = len(selected)
+            stats["skip"] = len(selected)
+            if on_progress:
+                _emit_progress("done", {"stats": stats})
+            return None, out_dir
+        log(f"[3/4] manifest 文件列表 {len(selected)} 个，待续传 {len(pending)} 个")
+        # total 用 manifest 计划总数：Web 端文件总数/进度按作品维度显示，而非本次续传数量
+        stats["total"] = len(selected)
+        return pending, out_dir
+
+    def _run_downloads(selected) -> dict:
+        """并发下载 selected（统一执行入口，原流程与 manifest 复用共用）。
+
+        依赖外层 out_dir / workers / retries / min_speed / stall_time / preallocate
+        / cancel_cb / _check_cancel / _emit_progress（调用前必须已就绪）。
+        """
+        # total 优先沿用外层已设置的（manifest 续传=作品计划总数），正常流程才按 selected 计
+        stats["total"] = stats.get("total") or len(selected)
+        log(f"[4/4] 开始下载（{workers} 线程，重试 {retries} 次）...")
+        progress = Progress(len(selected))
+        used_dest_names = set()  # P1-07: 同目录内文件名冲突唯一化
+
+        def worker(item):
+            rel_dir, node = item
+            _check_cancel()
+            dest = out_dir / rel_dir / sanitize_filename(node.get("title") or "untitled")
+            if dest.name in used_dest_names:
+                stem, suffix = dest.stem, dest.suffix
+                i = 1
+                while True:
+                    cand = dest.with_name(f"{stem}_{i}{suffix}")
+                    if cand.name not in used_dest_names and not cand.exists():
+                        dest = cand
+                        break
+                    i += 1
+            used_dest_names.add(dest.name)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            # m4a 转换项：API size 是源文件（wav/flac）大小，不可信 → expected=0，
+            # 大小以响应 Content-Length 为准；"已存在跳过"按目标 .m4a 存在且 size>0 判断
+            expected = 0 if node.get("_m4a") else int(node.get("size") or 0)
+            if dest.exists() and dest.stat().st_size > 0 and (not expected or dest.stat().st_size == expected):
+                progress.tick("skip")
+                if on_progress:
+                    _emit_progress("file", {"index": progress.done, "total": stats["total"],
+                                         "path": str(dest), "ok": True, "skip": True})
+                return None
+            with _global_download_semaphore:
+                ok, reason = download_file(node["mediaDownloadUrl"], dest, expected, retries, min_speed,
+                                           stall_time, preallocate=preallocate, cancel_cb=cancel_cb)
+            _check_cancel()
+            progress.tick("ok" if ok else "fail")
+            if on_progress:
+                _emit_progress("file", {"index": progress.done, "total": stats["total"],
+                                     "path": str(dest), "ok": ok})
+            if not ok:
+                return {"path": str(dest), "reason": reason or "下载失败"}
+            return None
+
+        pool = ThreadPoolExecutor(max_workers=workers)
+        failed_files = []
+        try:
+            futures = [pool.submit(worker, item) for item in selected]
+            try:
+                for fut in as_completed(futures):
+                    try:
+                        err = fut.result(timeout=30)
+                    except DownloadCancelled:
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        err = f"下载线程异常: {e}"
+                    if err:
+                        failed_files.append(err)
+            except DownloadCancelled:
+                log("[取消] 收到取消信号，终止等待剩余文件线程")
+                raise
+        finally:
+            # 取消时立即收尾：未启动的 future 丢弃，已运行线程靠 cancel_cb 检查点退出
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        stats["success"] = progress.ok
+        stats["skip"] = progress.skipped
+        stats["fail"] = len(failed_files)
+        stats["failed_files"] = failed_files
+        if on_progress:
+            _emit_progress("done", {"stats": stats})
+        return stats
+
     try:
         rj_digits = extract_rj_number(rj_input)
         stats["rj"] = f"RJ{rj_digits}"
         log(f"[1/4] 识别 RJ 号: RJ{rj_digits}")
+        output_base = output_dir if output_dir else get_default_output_dir()
 
-        work_info, rj_used = fetch_work_info(rj_digits)
+        # 优先复用本地 manifest：有效则跳过 workInfo/tracks API，直接续传
+        manifest_data, manifest_out_dir = _load_manifest(output_base, rj_digits)
+        if manifest_data is not None:
+            pending, out_dir = _use_manifest(manifest_data, manifest_out_dir, via_api_fallback=False)
+            if pending is None:
+                return stats
+            selected = pending
+            log(f"[4/4] 开始续传（{workers} 线程，重试 {retries} 次）...")
+            return _run_downloads(selected)
+
+        try:
+            work_info, rj_used = fetch_work_info(rj_digits)
+        except Exception as e:  # noqa: BLE001
+            # workInfo API 失败：尝试用本地 manifest 兜底续传
+            manifest_data, manifest_out_dir = _load_manifest(output_base, rj_digits)
+            if manifest_data is None:
+                raise
+            log(f"[1/4] workInfo API 请求失败: {e}")
+            pending, out_dir = _use_manifest(manifest_data, manifest_out_dir, via_api_fallback=True)
+            if pending is None:
+                return stats
+            selected = pending
+            log(f"[4/4] 开始续传（{workers} 线程，重试 {retries} 次）...")
+            return _run_downloads(selected)
+
         title = extract_title(work_info)
         stats["title"] = title
         _emit_progress("meta", {"rj": stats["rj"], "title": title})
 
         folder_name = sanitize_filename(f"RJ{rj_digits}_{title}")
-        output_base = output_dir if output_dir else get_default_output_dir()
         out_dir = Path(output_base) / folder_name
         out_dir.mkdir(parents=True, exist_ok=True)
         stats["out_dir"] = str(out_dir)
@@ -1389,75 +1647,8 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
                 _emit_progress("done", {"stats": stats})
             return stats
 
-        stats["total"] = len(selected)
-        log(f"[4/4] 开始下载（{workers} 线程，重试 {retries} 次）...")
-        progress = Progress(len(selected))
-        used_dest_names = set()  # P1-07: 同目录内文件名冲突唯一化
-
-        def worker(item):
-            rel_dir, node = item
-            _check_cancel()
-            dest = out_dir / rel_dir / sanitize_filename(node.get("title") or "untitled")
-            if dest.name in used_dest_names:
-                stem, suffix = dest.stem, dest.suffix
-                i = 1
-                while True:
-                    cand = dest.with_name(f"{stem}_{i}{suffix}")
-                    if cand.name not in used_dest_names and not cand.exists():
-                        dest = cand
-                        break
-                    i += 1
-            used_dest_names.add(dest.name)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            # m4a 转换项：API size 是源文件（wav/flac）大小，不可信 → expected=0，
-            # 大小以响应 Content-Length 为准；"已存在跳过"按目标 .m4a 存在且 size>0 判断
-            expected = 0 if node.get("_m4a") else int(node.get("size") or 0)
-            if dest.exists() and dest.stat().st_size > 0 and (not expected or dest.stat().st_size == expected):
-                progress.tick("skip")
-                if on_progress:
-                    _emit_progress("file", {"index": progress.done, "total": progress.total,
-                                         "path": str(dest), "ok": True, "skip": True})
-                return None
-            with _global_download_semaphore:
-                ok, reason = download_file(node["mediaDownloadUrl"], dest, expected, retries, min_speed,
-                                           stall_time, preallocate=preallocate, cancel_cb=cancel_cb)
-            _check_cancel()
-            progress.tick("ok" if ok else "fail")
-            if on_progress:
-                _emit_progress("file", {"index": progress.done, "total": progress.total,
-                                     "path": str(dest), "ok": ok})
-            if not ok:
-                return {"path": str(dest), "reason": reason or "下载失败"}
-            return None
-
-        pool = ThreadPoolExecutor(max_workers=workers)
-        failed_files = []
-        try:
-            futures = [pool.submit(worker, item) for item in selected]
-            try:
-                for fut in as_completed(futures):
-                    try:
-                        err = fut.result(timeout=30)
-                    except DownloadCancelled:
-                        raise
-                    except Exception as e:  # noqa: BLE001
-                        err = f"下载线程异常: {e}"
-                    if err:
-                        failed_files.append(err)
-            except DownloadCancelled:
-                log("[取消] 收到取消信号，终止等待剩余文件线程")
-                raise
-        finally:
-            # 取消时立即收尾：未启动的 future 丢弃，已运行线程靠 cancel_cb 检查点退出
-            pool.shutdown(wait=False, cancel_futures=True)
-
-        stats["success"] = progress.ok
-        stats["skip"] = progress.skipped
-        stats["fail"] = len(failed_files)
-        stats["failed_files"] = failed_files
-        if on_progress:
-            _emit_progress("done", {"stats": stats})
-        return stats
+        _save_manifest(out_dir, stats["rj"], title, selected)
+        return _run_downloads(selected)
     except DownloadCancelled:
         raise
     except KeyboardInterrupt:
@@ -1496,7 +1687,18 @@ def main() -> int:
     parser.add_argument("--stall-time", type=positive_float, default=DEFAULT_STALL_TIME, help=f"平均速率低于阈值持续秒数后中断连接触发重试（默认 {DEFAULT_STALL_TIME}）")
     parser.add_argument("--log-file", default="", help="日志落盘文件路径（UTF-8，追加）")
     parser.add_argument("--no-preallocate", action="store_true", help="不预分配磁盘空间（稀疏式边下边写），磁盘占用按实际写入增长")
+    parser.add_argument("--json-progress", action="store_true",
+                        help="输出机器可读进度 JSON 行（##JSON## 前缀）到 stdout，供外部进程解析")
     args = parser.parse_args()
+
+    def _json_progress(rj: str, stage: str, data: dict) -> None:
+        """机器可读进度输出：##JSON## 前缀 + 单行 JSON，UTF-8 写 stdout（不受控制台编码影响）。"""
+        line = "##JSON##" + json.dumps(
+            {"event": "progress", "rj": rj, "stage": stage, "data": data},
+            ensure_ascii=False, default=str,
+        )
+        sys.stdout.buffer.write(line.encode("utf-8", errors="replace") + b"\n")
+        sys.stdout.buffer.flush()
 
     # P1-10 配置合并：环境变量 > CLI 显式参数 > config.json（默认脚本目录 config.json / --config 指定）
     if args.config:
@@ -1550,12 +1752,16 @@ def main() -> int:
     try:
         for idx, rj_input in enumerate(inputs, 1):
             log(f"\n===== 作品 [{idx}/{len(inputs)}]: {rj_input} =====")
+            on_progress = None
+            if args.json_progress:
+                on_progress = lambda stage, data: _json_progress(rj_input, stage, data)  # noqa: E731
             stats = download_work(
                 rj_input, output_dir=args.output, types=args.types, exts=args.ext,
                 exclude_exts=args.exclude_ext, include_regex=args.include_regex,
                 exclude_regex=args.exclude_regex, workers=args.workers, retries=args.retries,
                 min_speed=args.min_speed, stall_time=args.stall_time,
                 preallocate=not args.no_preallocate,
+                on_progress=on_progress,
             )
             summary["works"] += 1
             summary["total"] += stats["total"]
