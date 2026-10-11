@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -33,7 +34,7 @@ API_BASE = "https://api.asmr-200.com/api"
 DEFAULT_WORKERS = 8
 DEFAULT_GLOBAL_WORKERS = 8  # 进程级全局下载线程上限（所有任务合计，默认 8，可配置）
 DEFAULT_RETRIES = 5
-CONNECT_TIMEOUT = 30
+CONNECT_TIMEOUT = 60  # 连接建立 + TLS 握手超时（秒）：覆盖 TCP connect / 代理 CONNECT 隧道 / SSL 握手，弱网代理下 30s 偏紧易触发 _ssl.c handshake timed out
 # 默认音轨策略（无显式 --ext/--exclude-ext 时生效）：
 # 组内 mp3 优先（多 mp3 取最大）；无 mp3 时 wav/flac 转 m4a；视频格式硬排除；文本/图片保留
 AUDIO_STRATEGY_EXTS = {"mp3", "wav", "flac"}
@@ -41,8 +42,8 @@ VIDEO_EXTS = {"mp4", "mkv", "webm", "avi", "mov", "m4v", "wmv", "flv", "ts", "mt
 CHUNK_SIZE = 256 * 1024
 MAX_ACTIVE_CHUNKS = 16
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) asmr-downloader/1.0"
-DEFAULT_MIN_SPEED = 20.0          # 最低平均速度看门狗阈值（KB/s）
-DEFAULT_STALL_TIME = 30.0         # 平均速率低于阈值持续秒数后中断连接触发重试
+DEFAULT_MIN_SPEED = 60.0          # 滑动窗口速度看门狗绝对下限阈值（KB/s）
+DEFAULT_STALL_TIME = 10.0         # 窗口速度低于阈值持续秒数后中断连接触发重试
 WATCHDOG_CHECK_BYTES = 1024 * 1024  # 每写入约 1MB 检查一次平均速率
 API_RETRY_TIMES = 3               # API 请求（元数据/文件树）网络类失败重试次数
 API_RETRY_BASE_DELAY = 1.0        # API 重试指数退避基数（秒）
@@ -144,6 +145,19 @@ class RetryableHTTPError(IOError):
     """服务端瞬时错误（HTTP 408/429/5xx）：归类为可重试，由重试循环接管。"""
 
 
+class APIResourceNotFoundError(IOError):
+    """API 返回 HTTP 404：作品/资源确定性不存在，应快速失败，不参与网络类重试。"""
+
+
+class DownloadCancelled(Exception):
+    """任务取消信号：cancel_cb 返回真，或进度回调抛出取消类异常时抛出。
+
+    传播路径：下载引擎内部检查点（分片/流式读循环）→ download_file → worker →
+    download_work 的 as_completed 循环（终止等待并收尾线程池）→ 调用方（server 标记 cancelled）。
+    该异常必须原样穿透所有 except 包装，禁止被当作普通下载失败处理。
+    """
+
+
 # 可重试的网络类异常集合：重试循环仅对这类异常重试，本地/确定性错误直接判定失败。
 # 注意：本地 IO 错误（磁盘满 OSError / PermissionError / ValueError 等）不在集合内。
 RETRYABLE_EXCEPTIONS = (
@@ -154,6 +168,7 @@ RETRYABLE_EXCEPTIONS = (
     ConnectionResetError,
     ConnectionAbortedError,
     BrokenPipeError,
+    ssl.SSLError,  # TLS 握手超时/意外 EOF（_ssl.c:989 / _ssl.c:1006）均为弱网代理抖动，应重试而非判死
     http.client.HTTPException,  # 连接池/协议层异常（BadStatusLine 等）
 )
 
@@ -163,10 +178,27 @@ def _is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, RETRYABLE_EXCEPTIONS) or isinstance(exc, (StallError, RetryableHTTPError))
 
 
-def _sleep_backoff(attempt: int) -> None:
-    """指数退避 + 随机抖动，避免多线程同步重试风暴。"""
+# socket 读超时轮询间隔：单次 recv 等待上限压缩到此值，超时后先查取消再继续，
+# 保证任务取消无需等待最长 120/300/600s 的读超时；累计无数据超过 read_timeout 仍判 stall。
+_CANCEL_POLL_INTERVAL = 5.0
+
+
+def _interruptible_sleep(seconds: float, cancel_cb=None) -> None:
+    """可中断分段 sleep：每 0.2s 检查一次 cancel_cb，取消立即抛 DownloadCancelled。"""
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        if cancel_cb and cancel_cb():
+            raise DownloadCancelled("用户取消")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.2, remaining))
+
+
+def _sleep_backoff(attempt: int, cancel_cb=None) -> None:
+    """指数退避 + 随机抖动，避免多线程同步重试风暴；支持取消中断。"""
     base = API_RETRY_BASE_DELAY * (2 ** max(0, attempt - 1))
-    time.sleep(max(0.0, base + random.uniform(0, 0.5)))
+    _interruptible_sleep(max(0.0, base + random.uniform(0, 0.5)), cancel_cb=cancel_cb)
 
 
 def _ensure_disk_space(dest: Path, expected_size: int) -> None:
@@ -267,6 +299,7 @@ class ConnectionPool:
         self.proxy = proxy
         self.timeout = timeout
         self._idle = []
+        self._active = set()  # 正在使用中的连接（含阻塞 recv），供 force_close_connections 强制关闭
         self._lock = threading.Lock()
 
     def acquire(self) -> _PooledConnection:
@@ -275,19 +308,24 @@ class ConnectionPool:
                 pc = self._idle.pop()
                 if pc.alive():
                     pc.in_use = True
+                    self._active.add(pc)
                     return pc
                 pc.close()
-        return _PooledConnection(self, self.scheme, self.host, self.port, self.proxy, self.timeout)
+        pc = _PooledConnection(self, self.scheme, self.host, self.port, self.proxy, self.timeout)
+        with self._lock:
+            self._active.add(pc)
+        return pc
 
     def release(self, pc: _PooledConnection, reusable: bool) -> None:
-        if pc.dead or not reusable:
-            pc.close()
-            return
-        pc.in_use = False
         with self._lock:
+            self._active.discard(pc)
             if len(self._idle) >= _POOL_MAX_IDLE:
                 pc.close()
                 return
+            if pc.dead or not reusable:
+                pc.close()
+                return
+            pc.in_use = False
             self._idle.append(pc)
 
     def clear(self) -> None:
@@ -296,6 +334,19 @@ class ConnectionPool:
             while self._idle:
                 pc = self._idle.pop()
                 pc.close()
+
+    def force_close(self) -> int:
+        """强制关闭本池全部连接（含正在使用），使阻塞中的 recv 立即返回；返回关闭数。"""
+        with self._lock:
+            items = list(self._idle) + list(self._active)
+            self._idle = []
+            self._active.clear()
+        closed = 0
+        for pc in items:
+            if not pc.dead:
+                pc.close()
+                closed += 1
+        return closed
 
 
 def _parse_proxy_endpoint(proxy: str):
@@ -310,6 +361,19 @@ def _parse_proxy_endpoint(proxy: str):
     host = m.group("host")
     port = int(m.group("port") or (443 if scheme == "https" else 8080))
     return host, port
+
+
+def force_close_connections() -> int:
+    """强制关闭所有连接池的全部连接（含正在使用），使阻塞中的 recv 立即抛错返回。
+
+    用于任务取消：底层 socket 关闭后，阻塞在 recv 的下载线程会立刻收到
+    timeout / ConnectionError，配合读循环中的 cancel_cb 检查点快速退出，无需等长读超时。
+    返回关闭的连接总数。
+    """
+    with _pools_lock:
+        pools = list(_pools.values())
+        _pools.clear()
+    return sum(pool.force_close() for pool in pools)
 
 
 def get_connection(url: str):
@@ -370,6 +434,9 @@ def http_get_json(url: str, timeout: int = 30, retries: int = API_RETRY_TIMES) -
         try:
             pc, resp = fetch_http(url, read_timeout=timeout)
             try:
+                if resp.status == 404:
+                    # 404 属确定性"资源不存在"（如无效 RJ 号），快速失败，不参与网络类重试
+                    raise APIResourceNotFoundError(f"HTTP 404 资源不存在（RJ 号可能无效）")
                 if resp.status != 200:
                     raise IOError(f"HTTP {resp.status}")
                 length_header = resp.headers.get("Content-Length")
@@ -384,6 +451,9 @@ def http_get_json(url: str, timeout: int = 30, retries: int = API_RETRY_TIMES) -
                 pc.release(reusable)
         except ValueError as e:
             # 确定性问题（协议/内容/JSON 解析错误）：不重试，直接抛出
+            raise
+        except APIResourceNotFoundError:
+            # 404 确定性不存在：不重试，直接抛出（由上层给出"RJ 号无效"提示）
             raise
         except Exception as e:  # noqa: BLE001
             last_exc = e
@@ -436,6 +506,11 @@ def fetch_work_info(rj_number: str):
             data = http_get_json(f"{API_BASE}/workInfo/{cand}?v2")
             if data:
                 return data, cand
+        except APIResourceNotFoundError as e:
+            # 404 确定性"作品不存在"：换 candidate 也一样，立即快速失败并提示 RJ 号无效
+            raise RuntimeError(
+                f"作品不存在（HTTP 404），请检查 RJ 号 RJ{rj_number} 是否有效"
+            ) from e
         except Exception as e:  # noqa: BLE001
             last_err = e
     raise RuntimeError(f"获取作品信息失败: {last_err}")
@@ -639,14 +714,10 @@ def probe_remote_size(url: str) -> int:
 
 
 def plan_chunks(total_size: int) -> list:
-    """按文件大小规划分片：<5MB 1 片；5~50MB 4 片；>50MB 8 片。返回 [(start, end), ...]。"""
+    """按文件大小规划分片：目标片大小约 4MB，自适应片数（至少 1 片）。返回 [(start, end), ...]。"""
     MB = 1024 * 1024
-    if total_size < 5 * MB:
-        n = 1
-    elif total_size <= 50 * MB:
-        n = 4
-    else:
-        n = 8
+    TARGET_CHUNK = 4 * MB
+    n = max(1, (total_size + TARGET_CHUNK - 1) // TARGET_CHUNK)
     if n <= 1:
         return [(0, total_size - 1)]
     base = total_size // n
@@ -738,11 +809,12 @@ def _enforce_min_speed(total_bytes: int, conn_start: float, stall_started: float
 def download_file(url: str, dest: Path, expected_size: int, retries: int,
                   min_speed_kbps: float = DEFAULT_MIN_SPEED,
                   stall_time: float = DEFAULT_STALL_TIME,
-                  preallocate: bool = True) -> tuple:
+                  preallocate: bool = True, cancel_cb=None) -> tuple:
     """下载单个文件：支持 Range 时走分片断点续传，否则退化整文件流式下载。
 
     expected_size <= 0 时（如 wav/flac 转 m4a，API size 是源文件大小不可信），
     先探测服务端实际大小，再按实际大小规划分片 / 校验 / 续传。
+    cancel_cb() 可选取消回调：返回真时抛 DownloadCancelled，终止下载（探测/分片/流式内部检查点）。
     返回 (ok: bool, reason: str)，失败时 reason 为具体失败原因（HTTP 状态码 / 异常消息等）。
     """
     part_path = dest.with_name(dest.name + ".part")
@@ -751,39 +823,54 @@ def download_file(url: str, dest: Path, expected_size: int, retries: int,
     if expected_size <= 0:
         # 探测可能因 CDN/代理瞬时抖动返回失败，重试最多 3 次
         for probe_attempt in range(3):
+            if cancel_cb and cancel_cb():
+                raise DownloadCancelled("用户取消")
             actual_size = probe_remote_size(url)
             if actual_size > 0:
                 break
             if probe_attempt < 2:
-                time.sleep(1.0)
+                _interruptible_sleep(1.0, cancel_cb)
         if actual_size > 0:
             log(f"    [探测] {dest.name}: 服务端实际大小 {actual_size} B（API size 不可信，以响应为准）")
     read_timeout = read_timeout_for_size(max(actual_size, expected_size))
     _ensure_disk_space(dest, max(actual_size, expected_size))
+    if cancel_cb and cancel_cb():
+        raise DownloadCancelled("用户取消")
     if actual_size > 0 and probe_range_support(url):
         log(f"    [Range] {dest.name}: 分片下载（{len(plan_chunks(actual_size))} 片，总 {actual_size} B）")
-        return download_file_range(url, part_path, meta_path, dest, actual_size, retries, read_timeout, min_speed_kbps, stall_time, preallocate)
+        return download_file_range(url, part_path, meta_path, dest, actual_size, retries, read_timeout, min_speed_kbps, stall_time, preallocate, cancel_cb=cancel_cb)
     if meta_path.exists():
         # 服务器不支持 Range：清理可能残留的分片 meta，走整文件下载
         meta_path.unlink()
     log(f"    [整文件] {dest.name}: 服务器不支持 Range，流式下载")
-    return download_file_whole(url, part_path, dest, actual_size, retries, read_timeout, min_speed_kbps, stall_time)
+    return download_file_whole(url, part_path, dest, actual_size, retries, read_timeout, min_speed_kbps, stall_time, cancel_cb=cancel_cb)
 
 
 def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: int, retries: int,
                         read_timeout: int,
                         min_speed_kbps: float = DEFAULT_MIN_SPEED,
-                        stall_time: float = DEFAULT_STALL_TIME) -> tuple:
-    """整文件流式下载（Range 退化路径）：先写 .part，成功后原子改名；连接/读超时独立兜底重试。
+                        stall_time: float = DEFAULT_STALL_TIME,
+                        cancel_cb=None) -> tuple:
+    """整文件流式下载（Range 退化路径）：先写 .part，成功后原子改名。
+
+    不启用最低速度看门狗：整文件无断点续传，30s 无新数据在弱网/代理下是常见抖动，
+    判死重试会反复浪费整个文件（日志中 3 次失败后第二次运行秒成功即为间歇抖动）；
+    改为分级读超时（read_timeout 120/300/600s）兜底，超时按可重试网络错误处理。
+    min_speed_kbps / stall_time 参数仅为兼容调用签名保留，流式模式不使用。
+    cancel_cb() 可选取消回调：每读一块后检查，返回真时抛 DownloadCancelled。
 
     返回 (ok: bool, reason: str)，失败时 reason 为最后一次失败的异常消息。
     """
     last_error = ""
     for attempt in range(1, retries + 1):
+        if cancel_cb and cancel_cb():
+            raise DownloadCancelled("用户取消")
         try:
             if part_path.exists():
                 part_path.unlink()
-            pc, resp = fetch_http(quote_url(url), read_timeout=min(read_timeout, stall_time))
+            # 单次 recv 等待上限压缩到 _CANCEL_POLL_INTERVAL：超时后先查取消再继续，
+            # 取消无需等最长 read_timeout；累计无数据超过 read_timeout 仍判 stall 重试。
+            pc, resp = fetch_http(quote_url(url), read_timeout=min(read_timeout, _CANCEL_POLL_INTERVAL))
             reusable = False
             try:
                 if resp.status != 200:
@@ -793,32 +880,26 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
                     raise IOError(f"HTTP {resp.status}")
                 conn_start = time.monotonic()
                 total_bytes = 0
-                last_check_bytes = 0
-                last_check_time = conn_start
-                stall_started = None
-                # 读块随 stall_time×min_speed 收缩，保证低速率下检查频率足够（滴流也能按时中断）
-                read_block = min(CHUNK_SIZE, max(32 * 1024, int(stall_time * min_speed_kbps * 1024 / 4)))
+                last_data_at = time.monotonic()
                 with open(part_path, "wb") as fh:
                     while True:
+                        if cancel_cb and cancel_cb():
+                            raise DownloadCancelled("用户取消")
                         try:
-                            chunk = resp.read(read_block)
+                            chunk = resp.read(CHUNK_SIZE)
                         except (TimeoutError, socket.timeout) as e:
-                            # 连续无数据超过 stall-time：最低速度看门狗触发，主动中断重试
-                            raise StallError(
-                                f"连续 {stall_time:.0f}s 无新数据（最低速度看门狗）: {dest.name}"
-                            ) from e
+                            if cancel_cb and cancel_cb():
+                                raise DownloadCancelled("用户取消") from e
+                            if time.monotonic() - last_data_at >= read_timeout:
+                                raise StallError(
+                                    f"连续无新数据超过 {read_timeout:.0f}s（读超时看门狗）: {part_path.name}"
+                                ) from e
+                            continue
                         if not chunk:
                             break
                         fh.write(chunk)
                         total_bytes += len(chunk)
-                        now = time.monotonic()
-                        if total_bytes - last_check_bytes >= WATCHDOG_CHECK_BYTES or now - last_check_time >= stall_time:
-                            stall_started = _enforce_min_speed(
-                                total_bytes, conn_start, stall_started,
-                                min_speed_kbps * 1024, stall_time, now
-                            )
-                            last_check_bytes = total_bytes
-                            last_check_time = now
+                        last_data_at = time.monotonic()
                 reusable = True  # body 已读尽，连接可复用
                 elapsed = time.monotonic() - conn_start
                 if elapsed > 0:
@@ -831,21 +912,23 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
                 )
             part_path.replace(dest)
             return True, ""
+        except DownloadCancelled:
+            raise
         except StallError as e:
             last_error = f"{type(e).__name__}: {e}"
             log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败(看门狗): {e}")
             if attempt < retries:
-                _sleep_backoff(attempt)
+                _sleep_backoff(attempt, cancel_cb)
         except RetryableHTTPError as e:
             last_error = f"{type(e).__name__}: {e}"
             log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败(HTTP {e}): {e}")
             if attempt < retries:
-                _sleep_backoff(attempt)
+                _sleep_backoff(attempt, cancel_cb)
         except RETRYABLE_EXCEPTIONS as e:
             last_error = f"{type(e).__name__}: {e}"
             log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败: {e}")
             if attempt < retries:
-                _sleep_backoff(attempt)
+                _sleep_backoff(attempt, cancel_cb)
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
             log(f"    [失败] {dest.name} 不可重试错误({type(e).__name__}): {e}")
@@ -855,18 +938,30 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
 
 def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout: int, retries: int,
                    min_speed_kbps: float = DEFAULT_MIN_SPEED,
-                   stall_time: float = DEFAULT_STALL_TIME) -> tuple:
+                   stall_time: float = DEFAULT_STALL_TIME,
+                   cancel_cb=None) -> tuple:
     """用 Range 下载一个分片到 .part 对应偏移；分片内部重试，耗尽后返回 False。
 
+    跨重试断点续传：offset 维护已成功写入的字节数，每次 attempt 从 start+offset
+    请求 Range，只补下剩余部分，避免重试重下已写入的数据。
+    速度看门狗：最近 8s 滑动窗口速度低于 max(60KB/s, 峰值×50%) 且持续超过
+    stall_time 时抛 StallError 触发重试；连续无数据（读超时）仍走 StallError。
     受全局信号量约束，控制总活跃分片数，避免与文件级并发叠加导致连接爆炸。
+    cancel_cb() 可选取消回调：每读一块后检查，返回真时抛 DownloadCancelled。
     返回 (ok: bool, reason: str)，失败时 reason 为最后一次失败的异常消息。
     """
     with _chunk_semaphore:
         last_error = ""
+        offset = 0  # 已成功写入本分片的字节数（跨 attempt 累计，实现断点续传）
         for attempt in range(1, retries + 1):
+            req_start = start + offset
+            if req_start > end:
+                break
+            if cancel_cb and cancel_cb():
+                raise DownloadCancelled("用户取消")
             try:
-                pc, resp = fetch_http(quote_url(url), headers={"Range": f"bytes={start}-{end}"},
-                                      read_timeout=min(read_timeout, stall_time))
+                pc, resp = fetch_http(quote_url(url), headers={"Range": f"bytes={req_start}-{end}"},
+                                      read_timeout=min(read_timeout, stall_time, _CANCEL_POLL_INTERVAL))
                 reusable = False
                 try:
                     if resp.status != 206:
@@ -879,41 +974,67 @@ def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout
                     m = re.match(r"bytes\s+(\d+)-(\d+)/", cr)
                     if m:
                         rstart = int(m.group(1))
-                    if rstart != start:
-                        raise IOError(f"Range 响应偏移不符: 请求 {start}, 响应 {rstart}")
+                    if rstart != req_start:
+                        raise IOError(f"Range 响应偏移不符: 请求 {req_start}, 响应 {rstart}")
                     conn_start = time.monotonic()
                     total_bytes = 0
-                    last_check_bytes = 0
-                    last_check_time = conn_start
-                    stall_started = None
+                    last_data_at = time.monotonic()
+                    # 滑动窗口速度看门狗：记录 (时间戳, 累计字节)，窗口速度 = (当前字节-窗口起点字节)/窗口时长
+                    window = deque()
+                    peak_speed = 0.0   # 本连接窗口速度历史峰值（B/s）
+                    slow_since = None  # 窗口速度持续低于阈值的起始时间
+                    window_secs = 8.0
                     # 读块随 stall_time×min_speed 收缩，保证低速率下检查频率足够（滴流也能按时中断）
                     read_block = min(CHUNK_SIZE, max(32 * 1024, int(stall_time * min_speed_kbps * 1024 / 4)))
                     with open(part_path, "r+b") as fh:
-                        fh.seek(rstart)
-                        remaining = end - rstart + 1
+                        fh.seek(req_start)
+                        remaining = end - req_start + 1
                         while remaining > 0:
+                            if cancel_cb and cancel_cb():
+                                raise DownloadCancelled("用户取消")
                             try:
                                 chunk = resp.read(min(read_block, remaining))
                             except (TimeoutError, socket.timeout) as e:
-                                # 连续无数据超过 stall-time：最低速度看门狗触发，主动中断重试
-                                raise StallError(
-                                    f"连续 {stall_time:.0f}s 无新数据（最低速度看门狗）: {part_path.name} [{start}-{end}]"
-                                ) from e
+                                # 单次 recv 超时（上限 _CANCEL_POLL_INTERVAL）：先查取消，未取消则继续；
+                                # 连续无数据累计超过 read_timeout 才判 stall 主动中断重试
+                                if cancel_cb and cancel_cb():
+                                    raise DownloadCancelled("用户取消") from e
+                                if time.monotonic() - last_data_at >= read_timeout:
+                                    raise StallError(
+                                        f"连续无新数据超过 {read_timeout:.0f}s（读超时看门狗）: "
+                                        f"{part_path.name} [{start}-{end}]"
+                                    ) from e
+                                continue
                             if not chunk:
                                 raise IOError(
                                     f"分片提前结束（连接中断）: {part_path.name} [{start}-{end}]"
                                 )
                             fh.write(chunk)
                             total_bytes += len(chunk)
+                            offset += len(chunk)  # 断点续传：字节落地即推进 offset，失败重试从 start+offset 继续
                             remaining -= len(chunk)
                             now = time.monotonic()
-                            if total_bytes - last_check_bytes >= WATCHDOG_CHECK_BYTES or now - last_check_time >= stall_time:
-                                stall_started = _enforce_min_speed(
-                                    total_bytes, conn_start, stall_started,
-                                    min_speed_kbps * 1024, stall_time, now
-                                )
-                                last_check_bytes = total_bytes
-                                last_check_time = now
+                            last_data_at = now
+                            window.append((now, total_bytes))
+                            while len(window) >= 2 and now - window[0][0] > window_secs:
+                                window.popleft()
+                            if now - window[0][0] >= window_secs:
+                                span = now - window[0][0]
+                                win_speed = (total_bytes - window[0][1]) / span
+                                peak_speed = max(peak_speed, win_speed)
+                                threshold = max(60 * 1024, peak_speed * 0.5)
+                                if win_speed < threshold:
+                                    if slow_since is None:
+                                        slow_since = now
+                                    elif now - slow_since >= stall_time:
+                                        raise StallError(
+                                            f"窗口速度 {win_speed / 1024:.1f} KB/s 低于阈值 "
+                                            f"{threshold / 1024:.1f} KB/s（峰值 {peak_speed / 1024:.1f} KB/s×25%），"
+                                            f"持续 {now - slow_since:.0f}s >= {stall_time:.0f}s（滑动窗口看门狗）: "
+                                            f"{part_path.name} [{start}-{end}]"
+                                        )
+                                else:
+                                    slow_since = None
                     reusable = True  # body 已读尽，连接可复用
                     elapsed = time.monotonic() - conn_start
                     if elapsed > 0:
@@ -921,21 +1042,23 @@ def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout
                 finally:
                     pc.release(reusable)
                 return True, ""
+            except DownloadCancelled:
+                raise
             except StallError as e:
                 last_error = f"{type(e).__name__}: {e}"
                 log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败(看门狗): {e}")
                 if attempt < retries:
-                    _sleep_backoff(attempt)
+                    _sleep_backoff(attempt, cancel_cb)
             except RetryableHTTPError as e:
                 last_error = f"{type(e).__name__}: {e}"
                 log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败(HTTP {e}): {e}")
                 if attempt < retries:
-                    _sleep_backoff(attempt)
+                    _sleep_backoff(attempt, cancel_cb)
             except RETRYABLE_EXCEPTIONS as e:
                 last_error = f"{type(e).__name__}: {e}"
                 log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败: {e}")
                 if attempt < retries:
-                    _sleep_backoff(attempt)
+                    _sleep_backoff(attempt, cancel_cb)
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"
                 log(f"      [分片失败] {part_path.name} [{start}-{end}] 不可重试错误({type(e).__name__}): {e}")
@@ -947,7 +1070,7 @@ def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, 
                         read_timeout: int,
                         min_speed_kbps: float = DEFAULT_MIN_SPEED,
                         stall_time: float = DEFAULT_STALL_TIME,
-                        preallocate: bool = True) -> tuple:
+                        preallocate: bool = True, cancel_cb=None) -> tuple:
     """Range 分片下载 + 分片级断点续传。
 
     - .part 按偏移写入各分片；完成状态持久化到 .part.meta.json。
@@ -956,6 +1079,7 @@ def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, 
     - 全部片完成后校验总大小，原子改名去掉 .part，删除 meta。
     - 任一单片重试耗尽则文件标记失败，但保留已完成的片与 meta 供下次续传。
     - preallocate=False 时不做全量预分配，分片按偏移写入时自动扩展（稀疏式边下边写）。
+    - cancel_cb() 可选取消回调：每片完成后 / 下一批提交前检查，返回真时抛 DownloadCancelled。
     """
     chunks = plan_chunks(total_size)
     meta = load_chunk_meta(meta_path)
@@ -988,6 +1112,8 @@ def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, 
         save_chunk_meta(meta_path, meta)
     chunk_states = meta["chunks"]
 
+    if cancel_cb and cancel_cb():
+        raise DownloadCancelled("用户取消")
     failed_any = False
     last_fail_reason = ""
     pending = [c for c in chunk_states if not c["completed"]]
@@ -995,14 +1121,18 @@ def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, 
     pool = ThreadPoolExecutor(max_workers=min(4, max(1, len(chunks))))
     try:
         while pending and not failed_any:
+            if cancel_cb and cancel_cb():
+                raise DownloadCancelled("用户取消")
             futures = {
-                pool.submit(download_chunk, url, part_path, c["start"], c["end"], read_timeout, retries, min_speed_kbps, stall_time): c
+                pool.submit(download_chunk, url, part_path, c["start"], c["end"], read_timeout, retries, min_speed_kbps, stall_time, cancel_cb): c
                 for c in pending
             }
             for fut in as_completed(futures):
                 c = futures[fut]
                 try:
                     ok, reason = fut.result(timeout=30)
+                except DownloadCancelled:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     log(f"      [分片线程异常] {part_path.name} [{c['start']}-{c['end']}]: {e}")
                     ok, reason = False, f"分片线程异常: {e}"
@@ -1012,10 +1142,15 @@ def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, 
                     failed_any = True
                     last_fail_reason = reason or f"分片 [{c['start']}-{c['end']}] 下载失败"
             save_chunk_meta(meta_path, meta)
+            if cancel_cb and cancel_cb():
+                raise DownloadCancelled("用户取消")
             pending = [c for c in chunk_states if not c["completed"]]
     finally:
-        pool.shutdown(wait=True)
+        # 取消时立即收尾：未启动的分片 future 丢弃，已运行分片靠 cancel_cb 读循环检查点退出
+        pool.shutdown(wait=False, cancel_futures=True)
 
+    if cancel_cb and cancel_cb():
+        raise DownloadCancelled("用户取消")
     if failed_any:
         log(f"    [分片失败] {part_path.name}: 存在重试耗尽的分片，保留 .part 与 .meta 供下次续传")
         return False, last_fail_reason
@@ -1066,11 +1201,84 @@ def positive_float(value: str) -> float:
     return fv
 
 
+def _pick_cover_url(work_info: object) -> str:
+    """从 workInfo 的 images 字段中提取一张可用的封面 URL（兼容 dict/list/str 结构）。"""
+    if not isinstance(work_info, dict):
+        return ""
+    images = work_info.get("images")
+    if isinstance(images, dict):
+        for key in ("main", "thumbnail", "sample", "small", "large"):
+            url = images.get(key)
+            if isinstance(url, str) and url.startswith("http"):
+                return url
+        for value in images.values():
+            if isinstance(value, str) and value.startswith("http"):
+                return value
+    elif isinstance(images, list):
+        for item in images:
+            if isinstance(item, str) and item.startswith("http"):
+                return item
+            if isinstance(item, dict):
+                for key in ("url", "main", "thumbnail", "small"):
+                    url = item.get(key)
+                    if isinstance(url, str) and url.startswith("http"):
+                        return url
+    elif isinstance(images, str) and images.startswith("http"):
+        return images
+    # API v2 workInfo 无 images 字段时，回退到封面直链字段（main/thumbnail/sam）
+    for key in ("mainCoverUrl", "thumbnailCoverUrl", "samCoverUrl"):
+        url = work_info.get(key)
+        if isinstance(url, str) and url.startswith("http"):
+            return url
+    return ""
+
+
+def _download_cover(url: str, dest: Path, timeout: int = 60) -> bool:
+    """下载封面图片到 dest；失败返回 False（不抛异常，避免阻塞下载流程）。"""
+    try:
+        pc, resp = fetch_http(url, read_timeout=timeout)
+        try:
+            if resp.status != 200:
+                return False
+            body = resp.read(8 * 1024 * 1024 + 1)
+            if len(body) > 8 * 1024 * 1024:
+                return False
+            dest.write_bytes(body)
+            return True
+        finally:
+            pc.release(resp.status == 200)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _save_meta_and_cover(out_dir: Path, work_info: object) -> None:
+    """下载开始阶段：把完整 meta 落盘为 meta.json（UTF-8），并尽力下载封面 cover.jpg。
+
+    - meta.json 写入失败仅告警，不阻塞下载；
+    - 封面下载失败同样不阻塞（作品库展示时 cover 缺失回退占位图）。
+    """
+    try:
+        meta_path = out_dir / "meta.json"
+        meta_path.write_text(
+            json.dumps(work_info, ensure_ascii=False, indent=2), encoding="utf-8")
+        log(f"    [meta] 已保存 meta.json")
+    except Exception as e:  # noqa: BLE001
+        log(f"    [meta] 写入 meta.json 失败（不阻塞）: {e}")
+    cover_url = _pick_cover_url(work_info)
+    if cover_url:
+        cover_dest = out_dir / "cover.jpg"
+        if not cover_dest.exists():
+            if _download_cover(cover_url, cover_dest):
+                log(f"    [封面] 已保存: {cover_dest.name}")
+            else:
+                log("    [封面] 下载失败（忽略，不影响下载）")
+
+
 def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: str = "",
                   exclude_exts: str = "", include_regex: str = "", exclude_regex: str = "",
                   workers: int = DEFAULT_WORKERS, retries: int = DEFAULT_RETRIES,
                   min_speed: float = DEFAULT_MIN_SPEED, stall_time: float = DEFAULT_STALL_TIME,
-                  preallocate: bool = True, on_progress=None) -> dict:
+                  preallocate: bool = True, on_progress=None, cancel_cb=None) -> dict:
     """下载单个作品完整流程：元数据 → 文件树 → 过滤 → 并发下载。
 
     CLI 与 server 共用入口（模块化重构核心）。保持 CLI 语义向后兼容。
@@ -1080,11 +1288,29 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
       - stage "filter": {"selected", "skipped"}
       - stage "file":   {"index", "total", "path", "ok", "skip"(可选)}
       - stage "done":   {"stats"}
+    cancel_cb() 可选取消回调：返回真时抛 DownloadCancelled 终止下载（回调需线程安全）。
+    取消信号在 worker 文件前后、进度回调前、分片每片完成后、流式读循环中周期检查。
     返回 stats dict：{rj, title, out_dir, total, success, skip, fail, failed_files,
                       error(可选)}
+    取消时抛 DownloadCancelled（由调用方决定如何标记），不返回 stats。
     """
     stats = {"rj": "", "title": "", "out_dir": "", "total": 0, "success": 0,
              "skip": 0, "fail": 0, "failed_files": []}
+
+    def _check_cancel() -> None:
+        """取消检查点：cancel_cb 返回真时抛 DownloadCancelled。"""
+        if cancel_cb and cancel_cb():
+            raise DownloadCancelled("用户取消")
+
+    def _emit_progress(stage: str, data: dict) -> None:
+        """进度回调统一出口：回调前检查取消；回调抛异常（如 server 的 CancelRequested）统一转抛 DownloadCancelled。"""
+        _check_cancel()
+        if on_progress:
+            try:
+                on_progress(stage, data)
+            except Exception as e:  # noqa: BLE001
+                raise DownloadCancelled("用户取消") from e
+
     try:
         rj_digits = extract_rj_number(rj_input)
         stats["rj"] = f"RJ{rj_digits}"
@@ -1093,22 +1319,23 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
         work_info, rj_used = fetch_work_info(rj_digits)
         title = extract_title(work_info)
         stats["title"] = title
-        if on_progress:
-            on_progress("meta", {"rj": stats["rj"], "title": title})
+        _emit_progress("meta", {"rj": stats["rj"], "title": title})
 
         folder_name = sanitize_filename(f"RJ{rj_digits}_{title}")
         output_base = output_dir if output_dir else get_default_output_dir()
         out_dir = Path(output_base) / folder_name
         out_dir.mkdir(parents=True, exist_ok=True)
         stats["out_dir"] = str(out_dir)
+        # 下载开始阶段：保存完整 meta 与封面，供本地作品库展示（失败不阻塞）
+        _save_meta_and_cover(out_dir, work_info)
         log(f"[2/4] 作品: {title}")
         log(f"      输出目录: {out_dir}")
 
         tracks = fetch_tracks(rj_used)
+        _check_cancel()
         leaves = collect_leaves(tracks)
         log(f"[3/4] 文件树叶子节点: {len(leaves)}")
-        if on_progress:
-            on_progress("tree", {"leaves": len(leaves)})
+        _emit_progress("tree", {"leaves": len(leaves)})
 
         inc_re = re.compile(include_regex) if include_regex else None
         exc_re = re.compile(exclude_regex) if exclude_regex else None
@@ -1155,11 +1382,11 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
         selected = final_selected
         log(f"      命中过滤规则: {len(selected)}（过滤掉 {skipped_filter}）")
         if on_progress:
-            on_progress("filter", {"selected": len(selected), "skipped": skipped_filter})
+            _emit_progress("filter", {"selected": len(selected), "skipped": skipped_filter})
         if not selected:
             log("没有符合条件的文件，结束。")
             if on_progress:
-                on_progress("done", {"stats": stats})
+                _emit_progress("done", {"stats": stats})
             return stats
 
         stats["total"] = len(selected)
@@ -1169,6 +1396,7 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
 
         def worker(item):
             rel_dir, node = item
+            _check_cancel()
             dest = out_dir / rel_dir / sanitize_filename(node.get("title") or "untitled")
             if dest.name in used_dest_names:
                 stem, suffix = dest.stem, dest.suffix
@@ -1187,15 +1415,16 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
             if dest.exists() and dest.stat().st_size > 0 and (not expected or dest.stat().st_size == expected):
                 progress.tick("skip")
                 if on_progress:
-                    on_progress("file", {"index": progress.done, "total": progress.total,
+                    _emit_progress("file", {"index": progress.done, "total": progress.total,
                                          "path": str(dest), "ok": True, "skip": True})
                 return None
             with _global_download_semaphore:
                 ok, reason = download_file(node["mediaDownloadUrl"], dest, expected, retries, min_speed,
-                                           stall_time, preallocate=preallocate)
+                                           stall_time, preallocate=preallocate, cancel_cb=cancel_cb)
+            _check_cancel()
             progress.tick("ok" if ok else "fail")
             if on_progress:
-                on_progress("file", {"index": progress.done, "total": progress.total,
+                _emit_progress("file", {"index": progress.done, "total": progress.total,
                                      "path": str(dest), "ok": ok})
             if not ok:
                 return {"path": str(dest), "reason": reason or "下载失败"}
@@ -1205,23 +1434,32 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
         failed_files = []
         try:
             futures = [pool.submit(worker, item) for item in selected]
-            for fut in as_completed(futures):
-                try:
-                    err = fut.result(timeout=30)
-                except Exception as e:  # noqa: BLE001
-                    err = f"下载线程异常: {e}"
-                if err:
-                    failed_files.append(err)
+            try:
+                for fut in as_completed(futures):
+                    try:
+                        err = fut.result(timeout=30)
+                    except DownloadCancelled:
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        err = f"下载线程异常: {e}"
+                    if err:
+                        failed_files.append(err)
+            except DownloadCancelled:
+                log("[取消] 收到取消信号，终止等待剩余文件线程")
+                raise
         finally:
-            pool.shutdown(wait=True, cancel_futures=True)
+            # 取消时立即收尾：未启动的 future 丢弃，已运行线程靠 cancel_cb 检查点退出
+            pool.shutdown(wait=False, cancel_futures=True)
 
         stats["success"] = progress.ok
         stats["skip"] = progress.skipped
         stats["fail"] = len(failed_files)
         stats["failed_files"] = failed_files
         if on_progress:
-            on_progress("done", {"stats": stats})
+            _emit_progress("done", {"stats": stats})
         return stats
+    except DownloadCancelled:
+        raise
     except KeyboardInterrupt:
         raise
     except Exception as e:  # noqa: BLE001
@@ -1229,7 +1467,7 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
         stats["error"] = f"{type(e).__name__}: {e}"
         log(f"[失败] 作品处理异常: {stats['error']}")
         if on_progress:
-            on_progress("done", {"stats": stats})
+            _emit_progress("done", {"stats": stats})
         return stats
 
 

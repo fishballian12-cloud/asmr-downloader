@@ -3,16 +3,21 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ASMR 下载管理端</title>
+  <title>ASMR 本地作品库</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div id="app">
     <header class="topbar">
-      <h1>ASMR 下载管理端</h1>
+      <h1>ASMR 本地作品库</h1>
+      <nav class="tabs">
+        <button class="tab" :class="{active: view === 'tasks'}" @click="switchView('tasks')">下载管理</button>
+        <button class="tab" :class="{active: view === 'library'}" @click="switchView('library')">作品库</button>
+      </nav>
       <span class="conn" :class="{ok: serverOk}">{{ serverOk ? '服务已连接' : '连接中…' }}</span>
     </header>
 
+    <div v-show="view === 'tasks'">
     <section class="panel create-panel">
       <h2>新建下载</h2>
       <textarea v-model="urlsText" rows="3"
@@ -78,36 +83,135 @@
         </div>
       </div>
     </section>
+    </div>
+
+    <!-- 作品库视图 -->
+    <div v-show="view === 'library'" class="library-view">
+      <template v-if="!detail">
+        <section class="panel lib-head">
+          <h2>作品库 <span class="count">{{ works.length }}</span></h2>
+          <button class="btn small" @click="loadLibrary" :disabled="libraryLoading">
+            {{ libraryLoading ? '刷新中…' : '刷新' }}
+          </button>
+        </section>
+        <div v-if="libraryLoading" class="empty">正在扫描作品库…</div>
+        <div v-else-if="works.length === 0" class="empty">暂无已下载作品，完成下载后即可在此查看。</div>
+        <div v-else class="work-grid">
+          <div v-for="w in works" :key="w.rj" class="work-card" @click="openWork(w.rj)">
+            <div class="work-cover">
+              <img v-if="w.cover_url" :src="w.cover_url" :alt="w.title" loading="lazy">
+              <div v-else class="cover-placeholder">无封面</div>
+            </div>
+            <div class="work-info">
+              <div class="work-title" :title="w.title">{{ w.title }}</div>
+              <div class="work-tags" v-if="tagList(w.meta).length">
+                <span class="tag" v-for="t in tagList(w.meta).slice(0, 4)" :key="t">{{ t }}</span>
+              </div>
+              <div class="work-sub">
+                <template v-if="circleText(w.meta)">{{ circleText(w.meta) }}</template>
+                <template v-if="vaText(w.meta)"><span class="dot">·</span>{{ vaText(w.meta) }}</template>
+                <template v-if="dateText(w.meta)"><span class="dot">·</span>{{ dateText(w.meta) }}</template>
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <template v-else>
+        <section class="panel detail-head">
+          <button class="btn small" @click="backToLibrary">← 返回作品库</button>
+        </section>
+        <div v-if="detailLoading" class="empty">正在加载作品详情…</div>
+        <template v-else-if="detail">
+          <section class="panel detail-main">
+            <div class="detail-cover">
+              <img v-if="detail.cover_url" :src="detail.cover_url" :alt="detail.title">
+              <div v-else class="cover-placeholder big">无封面</div>
+            </div>
+            <div class="detail-meta">
+              <h2>{{ detail.title }}</h2>
+              <div class="detail-row" v-if="detail.rj"><b>RJ</b>{{ detail.rj }}</div>
+              <div class="detail-row" v-if="circleText(detail.meta)"><b>社团</b>{{ circleText(detail.meta) }}</div>
+              <div class="detail-row" v-if="vaText(detail.meta)"><b>声优</b>{{ vaText(detail.meta) }}</div>
+              <div class="detail-row" v-if="durationText(detail.meta)"><b>时长</b>{{ durationText(detail.meta) }}</div>
+              <div class="detail-row" v-if="dateText(detail.meta)"><b>发售日</b>{{ dateText(detail.meta) }}</div>
+              <div class="detail-row" v-if="tagList(detail.meta).length">
+                <b>标签</b>
+                <span class="tag" v-for="t in tagList(detail.meta)" :key="t">{{ t }}</span>
+              </div>
+              <div class="detail-row" v-if="descText(detail.meta)">
+                <b>简介</b>
+                <p class="desc">{{ descText(detail.meta) }}</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h2>音频 <span class="count">{{ detailGroups.audio.length }}</span></h2>
+            <div v-if="detailGroups.audio.length === 0" class="empty">无音频文件</div>
+            <div v-for="(f, i) in detailGroups.audio" :key="f.path" class="file-row">
+              <span class="file-name">{{ i + 1 }}. {{ f.name }}</span>
+              <span class="file-size">{{ formatSize(f.size) }}</span>
+              <button class="btn small primary" @click="playAudio(f)">播放</button>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h2>图片 <span class="count">{{ detailGroups.image.length }}</span></h2>
+            <div v-if="detailGroups.image.length === 0" class="empty">无图片文件</div>
+            <div v-for="f in detailGroups.image" :key="f.path" class="file-row">
+              <span class="file-name">{{ f.name }}</span>
+              <span class="file-size">{{ formatSize(f.size) }}</span>
+              <button class="btn small" @click="openImage(f)">预览</button>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h2>文本 <span class="count">{{ detailGroups.text.length }}</span></h2>
+            <div v-if="detailGroups.text.length === 0" class="empty">无文本文件</div>
+            <div v-for="f in detailGroups.text" :key="f.path" class="file-row">
+              <span class="file-name">{{ f.name }}</span>
+              <span class="file-size">{{ formatSize(f.size) }}</span>
+              <button class="btn small" @click="openText(f)">查看</button>
+            </div>
+          </section>
+
+          <section class="panel" v-if="detailGroups.other.length">
+            <h2>其他 <span class="count">{{ detailGroups.other.length }}</span></h2>
+            <div v-for="f in detailGroups.other" :key="f.path" class="file-row">
+              <span class="file-name">{{ f.name }}</span>
+              <span class="file-size">{{ formatSize(f.size) }}</span>
+            </div>
+          </section>
+        </template>
+      </template>
+    </div>
+
+    <!-- 音频播放器 -->
+    <div v-if="currentAudio" class="player-bar">
+      <audio :src="currentAudio" controls autoplay></audio>
+      <button class="btn small" @click="currentAudio = ''">停止</button>
+    </div>
+
+    <!-- 图片预览弹层 -->
+    <div v-if="previewImage" class="lightbox" @click.self="previewImage = ''">
+      <img :src="previewImage" alt="预览">
+      <button class="btn small lightbox-close" @click="previewImage = ''">关闭</button>
+    </div>
+
+    <!-- 文本查看弹层 -->
+    <div v-if="previewText" class="lightbox" @click.self="previewText = ''">
+      <div class="text-viewer">
+        <div class="text-viewer-head">
+          <strong>{{ previewTextName }}</strong>
+          <button class="btn small" @click="previewText = ''">关闭</button>
+        </div>
+        <pre>{{ previewText }}</pre>
+      </div>
+    </div>
   </div>
 
-  <script>
-    // Vue3 多源加载：主 CDN 失败自动回退备用 CDN；加载成功后再注入 app.js（保证顺序）
-    (function () {
-      var CDNS = [
-        'https://cdn.bootcdn.net/ajax/libs/vue/3.4.21/vue.global.prod.js',
-        'https://cdn.staticfile.org/vue/3.4.21/vue.global.prod.js',
-        'https://unpkg.com/vue@3/dist/vue.global.prod.js'
-      ];
-      var i = 0;
-      function load() {
-        if (i >= CDNS.length) {
-          console.error('[vue] 所有 CDN 加载失败，请检查网络后刷新');
-          document.getElementById('app').innerHTML =
-            '<p style="padding:20px;color:#c00">Vue 加载失败，请检查网络连接后刷新页面</p>';
-          return;
-        }
-        var s = document.createElement('script');
-        s.src = CDNS[i++];
-        s.onload = function () {
-          var app = document.createElement('script');
-          app.src = 'app.js';
-          document.head.appendChild(app);
-        };
-        s.onerror = load;
-        document.head.appendChild(s);
-      }
-      load();
-    })();
-  </script>
+  <script src="vue.global.prod.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
