@@ -12,6 +12,7 @@ ASMR 作品下载器命令行工具。
 """
 
 import argparse
+import errno
 import http.client
 import json
 import os
@@ -36,8 +37,10 @@ DEFAULT_GLOBAL_WORKERS = 8  # 进程级全局下载线程上限（所有任务�
 DEFAULT_RETRIES = 5
 CONNECT_TIMEOUT = 60  # 连接建立 + TLS 握手超时（秒）：覆盖 TCP connect / 代理 CONNECT 隧道 / SSL 握手，弱网代理下 30s 偏紧易触发 _ssl.c handshake timed out
 # 默认音轨策略（无显式 --ext/--exclude-ext 时生效）：
-# 组内 mp3 优先（多 mp3 取最大）；无 mp3 时 wav/flac 转 m4a；视频格式硬排除；文本/图片保留
-AUDIO_STRATEGY_EXTS = {"mp3", "wav", "flac"}
+# 音轨按去扩展名文件名归并（跨目录同曲合并），每曲只留最高优先级一个格式：
+# 原声 m4a > wav/flac 转 m4a（多取 size 最大，wav 优先）> mp3（多取 size 最大）；
+# 视频格式硬排除；文本/图片/其他音频保留
+AUDIO_STRATEGY_EXTS = {"mp3", "wav", "flac", "m4a"}
 VIDEO_EXTS = {"mp4", "mkv", "webm", "avi", "mov", "m4v", "wmv", "flv", "ts", "mts", "mpg", "mpeg"}
 CHUNK_SIZE = 256 * 1024
 MAX_ACTIVE_CHUNKS = 16
@@ -181,14 +184,27 @@ def _is_retryable(exc: BaseException) -> bool:
 
 
 def _is_timed_out_oserror(exc: BaseException) -> bool:
-    """判断是否为 http.client 读超时后再次读取触发的普通 OSError。
+    """判断是否为读超时/连接超时类普通 OSError，属于可重试网络错误。
 
     典型消息 "cannot read from timed out object"：底层 socket 读超时后响应对象
     已失效，再 read 抛出不带 errno 的普通 OSError，不在 RETRYABLE_EXCEPTIONS
     集合内。通过消息特征识别为可重试网络错误；磁盘满（ENOSPC）等本地 IO 错误
-    不含 "timed out" 消息，仍不可重试。
+    不含超时消息，仍不可重试。
+
+    同时覆盖 Windows 环境常见变体：
+    - 消息含 "timeout"（"The read operation timed out" 等英文变体）
+    - errno 为网络超时/连接中断类（ETIMEDOUT=110、WSAETIMEDOUT=10060、
+      WSAECONNRESET=10054、WSAECONNABORTED=10053、WSAENETRESET=10052），
+      这类错误消息多为中文（如 WinError 10060 连接尝试失败），不依赖字符串匹配。
     """
-    return isinstance(exc, OSError) and "timed out" in str(exc)
+    if not isinstance(exc, OSError):
+        return False
+    msg = str(exc)
+    if "timed out" in msg or "timeout" in msg:
+        return True
+    if exc.errno in (errno.ETIMEDOUT, 10060, 10054, 10053, 10052):
+        return True
+    return False
 
 
 # socket 读超时轮询间隔：单次 recv 等待上限压缩到此值，超时后先查取消再继续，
@@ -610,20 +626,22 @@ def to_m4a_url(url: str) -> str:
 
 
 def select_audio_member(members: list) -> tuple:
-    """音轨组内选择：mp3 优先（多个 mp3 取 size 最大）；无 mp3 有 wav/flac 则选 wav 转 m4a。
+    """音轨组内选择：原声 m4a 最高优先；无 m4a 时 wav/flac 转 m4a 次之；仅剩 mp3 才保留。
 
-    members: [(rel_dir, node), ...]（同一曲目不同扩展名）
+    members: [(rel_dir, node), ...]（同一曲目不同扩展名/不同目录）
     返回 (rel_dir, node)，其中 wav/flac 节点被改造为 m4a 下载项：
       - node["mediaDownloadUrl"] -> .m4a URL
       - node["title"] -> 同名 .m4a
       - node["_m4a"] = True（worker 据此不校验 API size，按响应实际大小）
+    优先级（只保留最高优先级一个格式，杜绝双格式并存）：
+      原声 m4a > wav/flac 转 m4a（wav 优先，同格式取 size 最大）> mp3（多取 size 最大）
     """
     def size_of(item: tuple) -> int:
         return int(item[1].get("size") or 0)
 
-    mp3s = [m for m in members if node_ext(m[1]) == "mp3"]
-    if mp3s:
-        return max(mp3s, key=size_of)
+    m4as = [m for m in members if node_ext(m[1]) == "m4a"]
+    if m4as:
+        return max(m4as, key=size_of)
     wavs = [m for m in members if node_ext(m[1]) == "wav"]
     flacs = [m for m in members if node_ext(m[1]) == "flac"]
     if wavs or flacs:
@@ -640,17 +658,24 @@ def select_audio_member(members: list) -> tuple:
         new_node["title"] = Path(node["title"]).stem + ".m4a"
         new_node["_m4a"] = True
         return (rel_dir, new_node)
+    mp3s = [m for m in members if node_ext(m[1]) == "mp3"]
+    if mp3s:
+        return max(mp3s, key=size_of)
     return members[0]
 
 
 def apply_default_audio_strategy(items: list) -> tuple:
-    """默认音轨策略：视频硬排除；文本/图片/其他音频原样保留；音轨按曲目分组择优。
+    """默认音轨策略：视频硬排除；文本/图片/其他音频原样保留；音轨按去扩展名文件名归并择优。
 
     items: [(rel_dir, node), ...]（已按 --types 过滤）
     返回 (selected, skipped_count)，selected 仍为 [(rel_dir, node), ...]。
+
+    归并规则：同 stem（去扩展名文件名）视为同一曲，跨目录（如 mp3\\ 与 wav\\）自动合并；
+    每曲只保留最高优先级一个格式（见 select_audio_member：m4a > 无损转 m4a > mp3），
+    杜绝同一曲目同时下载多种格式。
     """
     keep = []
-    groups = {}  # (rel_dir, stem) -> [(rel_dir, node), ...]
+    groups = {}  # stem -> [(rel_dir, node), ...]
     skipped = 0
     for rel_dir, node in items:
         ext = node_ext(node)
@@ -660,7 +685,7 @@ def apply_default_audio_strategy(items: list) -> tuple:
             continue
         if ext in AUDIO_STRATEGY_EXTS:
             stem = Path(node.get("title") or "").stem
-            groups.setdefault((rel_dir, stem), []).append((rel_dir, node))
+            groups.setdefault(stem, []).append((rel_dir, node))
         else:
             # 文本/图片/其他音频（ogg/aac 等）保留现有下载行为
             keep.append((rel_dir, node))
@@ -945,10 +970,14 @@ def download_file_whole(url: str, part_path: Path, dest: Path, expected_size: in
         except OSError as e:
             if _is_timed_out_oserror(e):
                 # http.client 读超时后再次 read 的普通 OSError：视为可重试网络错误
-                last_error = f"{type(e).__name__}: {e}"
-                log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败(读超时): {e}")
                 if attempt < retries:
+                    last_error = f"{type(e).__name__}: {e}"
+                    log(f"    [重试] {dest.name} 第 {attempt}/{retries} 次失败(读超时): {e}")
                     _sleep_backoff(attempt, cancel_cb)
+                else:
+                    # 连续重试全部读超时：给明确失败原因，不再裸抛 OSError
+                    last_error = f"连续 {retries} 次重试失败（读超时）: {type(e).__name__}: {e}"
+                    log(f"    [失败] {dest.name} 连续 {retries} 次重试失败（读超时）: {e}")
             else:
                 # 磁盘满等本地 IO 错误仍不可重试
                 last_error = f"{type(e).__name__}: {e}"
@@ -1088,10 +1117,14 @@ def download_chunk(url: str, part_path: Path, start: int, end: int, read_timeout
                 if _is_timed_out_oserror(e):
                     # http.client 读超时后再次 read 的普通 OSError：视为可重试网络错误，
                     # offset 已累计已写入字节，重试从 start+offset 继续（断点续传）
-                    last_error = f"{type(e).__name__}: {e}"
-                    log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败(读超时): {e}")
                     if attempt < retries:
+                        last_error = f"{type(e).__name__}: {e}"
+                        log(f"      [分片重试] {part_path.name} [{start}-{end}] 第 {attempt}/{retries} 次失败(读超时): {e}")
                         _sleep_backoff(attempt, cancel_cb)
+                    else:
+                        # 连续重试全部读超时：给明确失败原因，不再裸抛 OSError
+                        last_error = f"连续 {retries} 次重试失败（读超时）: {type(e).__name__}: {e}"
+                        log(f"      [分片失败] {part_path.name} [{start}-{end}] 连续 {retries} 次重试失败（读超时）: {e}")
                 else:
                     # 磁盘满等本地 IO 错误仍不可重试
                     last_error = f"{type(e).__name__}: {e}"
@@ -1615,7 +1648,7 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
         if use_default_strategy:
             selected, strategy_skipped = apply_default_audio_strategy(type_filtered)
             skipped_filter += strategy_skipped
-            log("      音轨策略: mp3 优先，无 mp3 则 wav/flac 转 m4a，视频格式硬排除，文本/图片保留")
+            log("      音轨策略: 按去扩展名文件名归并，m4a 优先（含 wav/flac 转 m4a），仅无 m4a 取 mp3，每曲只留最高优先级一个格式，视频硬排除，文本/图片保留")
         else:
             exclude_set = set(explicit_exclude)
             selected = []
