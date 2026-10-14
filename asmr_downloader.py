@@ -625,57 +625,39 @@ def to_m4a_url(url: str) -> str:
     )
 
 
-def select_audio_member(members: list) -> tuple:
-    """音轨组内选择：原声 m4a 最高优先；无 m4a 时 wav/flac 转 m4a 次之；仅剩 mp3 才保留。
+def _to_m4a_node(node: dict) -> dict:
+    """把 wav/flac 节点改造为 m4a 下载项（服务器自动转码）。
 
-    members: [(rel_dir, node), ...]（同一曲目不同扩展名/不同目录）
-    返回 (rel_dir, node)，其中 wav/flac 节点被改造为 m4a 下载项：
-      - node["mediaDownloadUrl"] -> .m4a URL
-      - node["title"] -> 同名 .m4a
-      - node["_m4a"] = True（worker 据此不校验 API size，按响应实际大小）
-    优先级（只保留最高优先级一个格式，杜绝双格式并存）：
-      原声 m4a > wav/flac 转 m4a（wav 优先，同格式取 size 最大）> mp3（多取 size 最大）
+    - node["mediaDownloadUrl"] -> .m4a 转码流 URL
+    - node["title"] -> 同名 .m4a
+    - node["_m4a"] = True（worker 据此不校验 API size，按响应实际大小）
     """
-    def size_of(item: tuple) -> int:
-        return int(item[1].get("size") or 0)
-
-    m4as = [m for m in members if node_ext(m[1]) == "m4a"]
-    if m4as:
-        return max(m4as, key=size_of)
-    wavs = [m for m in members if node_ext(m[1]) == "wav"]
-    flacs = [m for m in members if node_ext(m[1]) == "flac"]
-    if wavs or flacs:
-        chosen = max(wavs, key=size_of) if wavs else max(flacs, key=size_of)  # wav 优先
-        rel_dir, node = chosen
-        new_node = dict(node)
-        stream_url = node.get("streamLowQualityUrl")
-        if stream_url:
-            # 源站转码流（fast.kiko /media/stream/*.m4a），已验证可用
-            new_node["mediaDownloadUrl"] = stream_url
-        else:
-            # 兜底：改 download 路径后缀让服务器转码（raw.kiko 常返回 404，仅作兜底）
-            new_node["mediaDownloadUrl"] = to_m4a_url(node["mediaDownloadUrl"])
-        new_node["title"] = Path(node["title"]).stem + ".m4a"
-        new_node["_m4a"] = True
-        return (rel_dir, new_node)
-    mp3s = [m for m in members if node_ext(m[1]) == "mp3"]
-    if mp3s:
-        return max(mp3s, key=size_of)
-    return members[0]
+    new_node = dict(node)
+    stream_url = node.get("streamLowQualityUrl")
+    if stream_url:
+        # 源站转码流（fast.kiko /media/stream/*.m4a），已验证可用
+        new_node["mediaDownloadUrl"] = stream_url
+    else:
+        # 兜底：改 download 路径后缀让服务器转码（raw.kiko 常返回 404，仅作兜底）
+        new_node["mediaDownloadUrl"] = to_m4a_url(node["mediaDownloadUrl"])
+    new_node["title"] = Path(node["title"]).stem + ".m4a"
+    new_node["_m4a"] = True
+    return new_node
 
 
 def apply_default_audio_strategy(items: list) -> tuple:
-    """默认音轨策略：视频硬排除；文本/图片/其他音频原样保留；音轨按去扩展名文件名归并择优。
+    """默认音轨策略（作品级格式全局屏蔽）：视频硬排除；文本/图片/其他音频原样保留。
 
     items: [(rel_dir, node), ...]（已按 --types 过滤）
     返回 (selected, skipped_count)，selected 仍为 [(rel_dir, node), ...]。
 
-    归并规则：同 stem（去扩展名文件名）视为同一曲，跨目录（如 mp3\\ 与 wav\\）自动合并；
-    每曲只保留最高优先级一个格式（见 select_audio_member：m4a > 无损转 m4a > mp3），
-    杜绝同一曲目同时下载多种格式。
+    全局规则（不做文件名/音轨匹配）：
+      - 整个作品音频计划中只要存在 m4a（含 wav/flac 可转 m4a），就全局剔除所有 mp3 下载项，
+        全部音频走 m4a：原声 m4a 直下、wav/flac 转 m4a（_to_m4a_node）；
+      - 仅当作品完全没有 m4a/wav/flac 时才下载 mp3。
     """
     keep = []
-    groups = {}  # stem -> [(rel_dir, node), ...]
+    audio = []  # 策略音频节点（m4a/mp3/wav/flac）
     skipped = 0
     for rel_dir, node in items:
         ext = node_ext(node)
@@ -684,14 +666,26 @@ def apply_default_audio_strategy(items: list) -> tuple:
             skipped += 1
             continue
         if ext in AUDIO_STRATEGY_EXTS:
-            stem = Path(node.get("title") or "").stem
-            groups.setdefault(stem, []).append((rel_dir, node))
+            audio.append((rel_dir, node))
         else:
             # 文本/图片/其他音频（ogg/aac 等）保留现有下载行为
             keep.append((rel_dir, node))
+    has_m4a_or_lossless = any(
+        node_ext(n) in ("m4a", "wav", "flac") for _, n in audio
+    )
     selected = list(keep)
-    for members in groups.values():
-        selected.append(select_audio_member(members))
+    for rel_dir, node in audio:
+        ext = node_ext(node)
+        if ext == "m4a":
+            selected.append((rel_dir, node))
+        elif ext in ("wav", "flac"):
+            # 有 m4a 源或可转 m4a 时，无损一律转 m4a 下载
+            selected.append((rel_dir, _to_m4a_node(node)))
+        else:  # mp3
+            if has_m4a_or_lossless:
+                skipped += 1  # 作品存在 m4a（含可转）时全局剔除 mp3
+            else:
+                selected.append((rel_dir, node))
     return selected, skipped
 
 
@@ -1217,8 +1211,9 @@ def download_file_range(url: str, part_path: Path, meta_path: Path, dest: Path, 
                 raise DownloadCancelled("用户取消")
             pending = [c for c in chunk_states if not c["completed"]]
     finally:
-        # 取消时立即收尾：未启动的分片 future 丢弃，已运行分片靠 cancel_cb 读循环检查点退出
-        pool.shutdown(wait=False, cancel_futures=True)
+        # 收尾：wait=True 确保分片线程真正结束（已运行分片靠 cancel_cb 读循环检查点
+        # 退出，不会无限等待）；未启动分片 future 由 cancel_futures 丢弃。
+        pool.shutdown(wait=True, cancel_futures=True)
 
     if cancel_cb and cancel_cb():
         raise DownloadCancelled("用户取消")
@@ -1456,7 +1451,7 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
             raise DownloadCancelled("用户取消")
 
     def _emit_progress(stage: str, data: dict) -> None:
-        """进度回调统一出口：回调前检查取消；回调抛异常（如 server 的 CancelRequested）统一转抛 DownloadCancelled。"""
+        """进度回调统一出口：回调前检查取消；回调内异常统一转抛 DownloadCancelled。"""
         _check_cancel()
         if on_progress:
             try:
@@ -1567,8 +1562,10 @@ def download_work(rj_input: str, output_dir: str = "", types: str = "", exts: st
                 log("[取消] 收到取消信号，终止等待剩余文件线程")
                 raise
         finally:
-            # 取消时立即收尾：未启动的 future 丢弃，已运行线程靠 cancel_cb 检查点退出
-            pool.shutdown(wait=False, cancel_futures=True)
+            # 收尾：wait=True 确保线程真正结束（已运行线程靠 cancel_cb 检查点退出，
+            # 不会无限等待）；未启动 future 由 cancel_futures 丢弃；取消后剩余的
+            # 已运行 future 仍会被逐个 result(timeout=30) 兜底，保证不卡住。
+            pool.shutdown(wait=True, cancel_futures=True)
 
         stats["success"] = progress.ok
         stats["skip"] = progress.skipped
@@ -1699,10 +1696,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         prog="asmr_downloader",
         description="ASMR 作品下载器：根据 RJ 号获取元数据与文件树并并发下载。",
-        epilog="默认音轨策略：同一曲目（同目录同文件名）组内 mp3 优先，多个 mp3 只保留最大；"
-               "无 mp3 时有 wav/flac 则下载其 m4a 转码格式（服务器自动转码，链接后缀改 .m4a，wav 优先于 flac）；"
-               "mp4/mkv/webm/avi/mov 等视频格式及 type=video 节点一律不下载；文本/图片等非音频文件正常下载。"
-               "显式提供 --ext 或 --exclude-ext 时覆盖默认策略，按指定扩展名过滤。",
+        epilog="默认音轨策略（格式全局屏蔽）：作品只要有 m4a（含 wav/flac 转 m4a）就全局剔除所有 mp3，"
+               "全部音频走 m4a（原声 m4a 直下、wav/flac 由服务器转码为 m4a）；仅当作品完全没有 m4a/wav/flac "
+               "时才下载 mp3；不做文件名/音轨匹配。mp4/mkv/webm/avi/mov 等视频格式及 type=video 节点一律不下载；"
+               "文本/图片等非音频文件正常下载。显式提供 --ext 或 --exclude-ext 时覆盖默认策略，按指定扩展名过滤。",
     )
     parser.add_argument("input", nargs="+", help="ASMR 作品地址（如 https://asmr.one/work/RJ01310099）或 RJ 号（RJ01310099），可传多个")
     parser.add_argument("--input-file", default="", help="作品清单文件（每行一个 RJ/URL），与命令行 input 合并")

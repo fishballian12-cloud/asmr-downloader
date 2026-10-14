@@ -17,7 +17,6 @@ import mimetypes
 import os
 import re
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -32,9 +31,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import asmr_downloader as ad  # noqa: E402
 
-# --- Windows Job Object：server 退出（含被强杀）时级联终止全部下载子进程，避免孤儿化 ---
-# Windows 无父子进程自动级联终止；把 server 自身与下载子进程纳入同一个 KILL_ON_JOB_CLOSE
-# 作业对象，Job 句柄随 server 进程终止被系统关闭时，作业内所有进程一并被终止。
+# --- Windows Job Object：保留兼容（单进程架构下无下载子进程，句柄创建无害） ---
+# 原用于 server 退出（含被强杀）时级联终止全部下载子进程避免孤儿化；单进程改造后
+# 下载引擎直接在 server 进程内线程池运行，不再派生子进程，Job Object 保留无害。
 _JOB_HANDLE = None
 try:
     import ctypes
@@ -362,10 +361,6 @@ def list_work_files(work_dir: Path) -> list:
 TASK_STATUS = ("queued", "running", "done", "failed", "cancelled")
 
 
-class CancelRequested(Exception):
-    """任务取消信号：由进度回调抛出，download_work 捕获后以 error=CancelRequested 结束。"""
-
-
 def now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -428,10 +423,13 @@ class TaskStore:
 
 
 class TaskRunner:
-    """任务调度：线程池并发管理下载子进程（每个任务一个独立 python 子进程执行 CLI 下载）。
+    """任务调度：线程池并发执行下载任务（单进程架构，直接调用引擎 download_work）。
 
-    进度通过子进程 stdout 的 ##JSON## 机器行回传解析；取消直接 terminate/kill 子进程；
-    重启后 running 任务经 TaskStore 恢复为 queued 重新入队（无对应子进程）。
+    每个任务在独立任务线程内 import 调用 asmr_downloader.download_work（线程内执行，
+    引擎内部保留文件级 ThreadPoolExecutor 并发与全局信号量限制）；进度经引擎
+    on_progress 回调直推（不解析子进程 stdout）；取消走引擎可中断链路
+    （cancel_cb + _interruptible_sleep + DownloadCancelled），不再 terminate/kill 进程；
+    重启后 running 任务经 TaskStore 恢复为 queued 重新入队（无对应线程）。
     """
 
     def __init__(self, store: TaskStore, workers: int = DEFAULT_WORKERS,
@@ -442,8 +440,7 @@ class TaskRunner:
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dl-task")
         self._active = set()      # 当前有监控线程的任务 id
         self._active_lock = threading.Lock()
-        self._procs = {}          # task_id -> subprocess.Popen（运行中下载子进程）
-        self._procs_lock = threading.Lock()
+        self._progress_lock = threading.Lock()  # 进度直推并发更新保护（file 阶段多 worker 回调）
         # 服务重启恢复：把磁盘中 queued 任务（含由 running 恢复来的）重新入队
         for task in self.store.all():
             if task.get("status") == "queued":
@@ -463,47 +460,8 @@ class TaskRunner:
             with self._active_lock:
                 self._active.discard(task_id)
 
-    def _build_cmd(self, task: dict) -> list:
-        """构建下载 CLI 子进程命令行（server 侧默认输出目录保持 cwd/download）。"""
-        script = Path(__file__).resolve().parent.parent / "asmr_downloader.py"
-        opts = task.get("options", {})
-        cmd = [sys.executable, str(script), task.get("url", ""),
-               "-o", opts.get("output", "") or str(Path(os.getcwd()) / "download"),
-               "-w", str(int(opts.get("workers", ad.DEFAULT_WORKERS))),
-               "-r", str(int(opts.get("retries", ad.DEFAULT_RETRIES))),
-               "--min-speed", str(float(opts.get("min_speed", ad.DEFAULT_MIN_SPEED))),
-               "--stall-time", str(float(opts.get("stall_time", ad.DEFAULT_STALL_TIME))),
-               "--json-progress"]
-        if self.proxy:
-            cmd += ["--proxy", self.proxy]
-        if opts.get("types"):
-            cmd += ["--types", str(opts["types"])]
-        if opts.get("ext"):
-            cmd += ["--ext", str(opts["ext"])]
-        if opts.get("exclude_ext"):
-            cmd += ["--exclude-ext", str(opts["exclude_ext"])]
-        if opts.get("include_regex"):
-            cmd += ["--include-regex", str(opts["include_regex"])]
-        if opts.get("exclude_regex"):
-            cmd += ["--exclude-regex", str(opts["exclude_regex"])]
-        if not bool(opts.get("preallocate", True)):
-            cmd += ["--no-preallocate"]
-        return cmd
-
-    @staticmethod
-    def _fail_detail(stats: dict, stderr_lines) -> str:
-        """从子进程统计/错误输出构造失败详情（优先 failed_files，其次 stderr 尾部）。"""
-        failed = stats.get("failed_files", []) or []
-        detail = "; ".join(
-            f"{Path(f.get('path')).name}: {f.get('reason')}" if isinstance(f, dict) else str(f)
-            for f in failed[:3]
-        )
-        if not detail and stderr_lines:
-            detail = " | ".join(str(x) for x in stderr_lines[-3:])
-        return detail or "下载失败"
-
     def _apply_progress(self, task: dict, stage: str, data: dict, state: dict) -> None:
-        """子进程进度行更新任务状态（等价原进程内 on_progress，取消由 cancel() 直接杀进程）。"""
+        """引擎 on_progress 直推更新任务状态（取消由 cancel() 置 cancel_requested 走引擎链路）。"""
         if stage == "meta":
             self.store.update(task, rj=data.get("rj", task.get("rj", "")),
                               title=data.get("title", task.get("title", "")))
@@ -512,27 +470,29 @@ class TaskRunner:
             self.store.update(task, files_total=selected, files_done=0,
                               files_ok=0, files_skip=0, files_fail=0, progress=0.0)
         elif stage == "file":
-            # 优先采用子进程上报的 total（manifest 续传路径不发 filter，files_total 已被清零）
-            files_total = data.get("total") or max(task.get("files_total", 0), 1)
-            done = data.get("index", 0)
-            ok = data.get("ok", False)
-            skip = bool(data.get("skip", False))
-            files_ok = task.get("files_ok", 0) + (1 if ok and not skip else 0)
-            files_skip = task.get("files_skip", 0) + (1 if skip else 0)
-            files_fail = task.get("files_fail", 0) + (0 if ok else 1)
-            # 速度：以已完成文件大小 / 耗时估算（文件级粒度）
-            try:
-                size = os.path.getsize(data["path"])
-                state["bytes_done"][0] += size
-            except OSError:
-                pass
-            elapsed = max(time.monotonic() - state["start_wall"], 0.01)
-            self.store.update(
-                task, files_done=done, files_ok=files_ok, files_skip=files_skip,
-                files_fail=files_fail, files_total=files_total,
-                progress=round(done / files_total * 100, 1),
-                speed_kbps=round(state["bytes_done"][0] / elapsed / 1024, 1),
-            )
+            # 单进程下 file 阶段由引擎内部多 worker 线程并发回调，需持锁保护计数与速度累加
+            with self._progress_lock:
+                # 优先采用引擎上报的 total（manifest 续传路径不发 filter，files_total 已被清零）
+                files_total = data.get("total") or max(task.get("files_total", 0), 1)
+                done = data.get("index", 0)
+                ok = data.get("ok", False)
+                skip = bool(data.get("skip", False))
+                files_ok = task.get("files_ok", 0) + (1 if ok and not skip else 0)
+                files_skip = task.get("files_skip", 0) + (1 if skip else 0)
+                files_fail = task.get("files_fail", 0) + (0 if ok else 1)
+                # 速度：以已完成文件大小 / 耗时估算（文件级粒度）
+                try:
+                    size = os.path.getsize(data["path"])
+                    state["bytes_done"][0] += size
+                except OSError:
+                    pass
+                elapsed = max(time.monotonic() - state["start_wall"], 0.01)
+                self.store.update(
+                    task, files_done=done, files_ok=files_ok, files_skip=files_skip,
+                    files_fail=files_fail, files_total=files_total,
+                    progress=round(done / files_total * 100, 1),
+                    speed_kbps=round(state["bytes_done"][0] / elapsed / 1024, 1),
+                )
         elif stage == "done":
             self.store.persist()
 
@@ -551,109 +511,68 @@ class TaskRunner:
         task["cancel_requested"] = False
         self.store.persist()
 
-        state = {"start_wall": time.monotonic(), "bytes_done": [0],
-                 "final_stats": None, "stderr_lines": []}
-        cmd = self._build_cmd(task)
-        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        state = {"start_wall": time.monotonic(), "bytes_done": [0], "final_stats": None}
+        opts = task.get("options", {})
+        out_dir = opts.get("output", "") or str(Path(os.getcwd()) / "download")
+
+        def _on_progress(stage: str, data: dict) -> None:
+            # 取消已置位后不再回写进度；done 的 stats 供收尾状态使用
+            if task.get("cancel_requested"):
+                return
+            if stage == "done":
+                stats = dict(data.get("stats") or {})
+                stats.setdefault("rj", data.get("rj", ""))
+                state["final_stats"] = stats
+            self._apply_progress(task, stage, data, state)
+
+        def _cancel_cb() -> bool:
+            return bool(task.get("cancel_requested"))
+
         try:
-            proc = subprocess.Popen(
-                cmd, cwd=str(Path(__file__).resolve().parent.parent),
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace",
-                bufsize=1, env=env,
+            stats = ad.download_work(
+                task.get("url", ""),
+                output_dir=out_dir,
+                types=str(opts.get("types", "")),
+                exts=str(opts.get("ext", "")),
+                exclude_exts=str(opts.get("exclude_ext", "")),
+                include_regex=str(opts.get("include_regex", "")),
+                exclude_regex=str(opts.get("exclude_regex", "")),
+                workers=int(opts.get("workers", ad.DEFAULT_WORKERS)),
+                retries=int(opts.get("retries", ad.DEFAULT_RETRIES)),
+                min_speed=float(opts.get("min_speed", ad.DEFAULT_MIN_SPEED)),
+                stall_time=float(opts.get("stall_time", ad.DEFAULT_STALL_TIME)),
+                preallocate=bool(opts.get("preallocate", True)),
+                on_progress=_on_progress,
+                cancel_cb=_cancel_cb,
             )
-        except OSError as e:
-            self.store.update(task, status="failed", error=f"启动下载进程失败: {e}",
-                              finished_at=now_str(), speed_kbps=0)
-            self.store.persist()
-            return
-        with self._procs_lock:
-            self._procs[task_id] = proc
-        _join_job(proc)  # 纳入 Job Object：server 退出时级联终止本子进程
-
-        def _read_stdout():
-            """解析子进程 stdout 的 ##JSON## 进度行并更新任务状态（取消后不再更新）。"""
-            try:
-                for line in proc.stdout:
-                    line = line.strip()
-                    if not line.startswith("##JSON##"):
-                        continue
-                    try:
-                        payload = json.loads(line[len("##JSON##"):])
-                    except json.JSONDecodeError:
-                        continue
-                    if payload.get("event") != "progress":
-                        continue
-                    stage = payload.get("stage", "")
-                    data = payload.get("data") or {}
-                    if task.get("cancel_requested"):
-                        continue
-                    if stage == "done":
-                        stats = dict(data.get("stats") or {})
-                        stats.setdefault("rj", data.get("rj", ""))
-                        state["final_stats"] = stats
-                    self._apply_progress(task, stage, data, state)
-            except Exception:  # noqa: BLE001
-                pass
-            finally:
-                try:
-                    proc.stdout.close()
-                except Exception:  # noqa: BLE001
-                    pass
-
-        def _read_stderr():
-            """收集子进程 stderr 尾部，失败时用于错误描述。"""
-            try:
-                for line in proc.stderr:
-                    state["stderr_lines"].append(line.rstrip("\n"))
-                    if len(state["stderr_lines"]) > 60:
-                        state["stderr_lines"] = state["stderr_lines"][-60:]
-            except Exception:  # noqa: BLE001
-                pass
-            finally:
-                try:
-                    proc.stderr.close()
-                except Exception:  # noqa: BLE001
-                    pass
-
-        out_t = threading.Thread(target=_read_stdout, daemon=True, name=f"dl-out-{task_id[:8]}")
-        err_t = threading.Thread(target=_read_stderr, daemon=True, name=f"dl-err-{task_id[:8]}")
-        out_t.start()
-        err_t.start()
-        try:
-            rc = proc.wait()
-        finally:
-            with self._procs_lock:
-                self._procs.pop(task_id, None)
-            for t in (out_t, err_t):
-                t.join(timeout=5.0)
-
-        # 取消：cancel() 已直接置 cancelled 并杀进程，这里兜底标记（幂等）
-        if task.get("cancel_requested"):
+        except ad.DownloadCancelled:
+            # 取消：cancel() 已置 cancel_requested，引擎走可中断链路抛出，这里兜底标记（幂等）
             self.store.update(task, status="cancelled", error="已取消",
                               finished_at=now_str(), speed_kbps=0)
             self.store.persist()
             return
+        except Exception as e:  # noqa: BLE001
+            self.store.update(task, status="failed", error=f"任务线程异常: {e}",
+                              finished_at=now_str(), speed_kbps=0)
+            self.store.persist()
+            return
 
-        stats = state["final_stats"] or {}
-        if rc != 0:
-            err = str(stats.get("error", ""))
-            if not err:
-                err = self._fail_detail(stats, state["stderr_lines"])
+        final = state["final_stats"] or stats or {}
+        if stats.get("error"):
             self.store.update(task, status="failed",
-                              error=err,
-                              files_fail=stats.get("fail", 0),
+                              error=str(stats.get("error", "")),
+                              files_fail=int(final.get("fail", 0) or stats.get("fail", 0)),
                               finished_at=now_str(), speed_kbps=0)
             self.store.persist()
             return
 
         self.store.update(task, status="done",
-                          files_total=stats.get("total", 0),
-                          files_done=stats.get("total", 0),
-                          files_ok=stats.get("success", 0),
-                          files_skip=stats.get("skip", 0),
+                          files_total=final.get("total", 0),
+                          files_done=final.get("total", 0),
+                          files_ok=final.get("success", 0),
+                          files_skip=final.get("skip", 0),
                           files_fail=0, progress=100.0,
-                          out_dir=stats.get("out_dir", ""),
+                          out_dir=str(final.get("out_dir", "") or stats.get("out_dir", "")),
                           finished_at=now_str(), speed_kbps=0)
         self.store.persist()
 
@@ -758,29 +677,10 @@ class TaskRunner:
                               finished_at=now_str())
             return True
         if task["status"] == "running":
-            with self._procs_lock:
-                proc = self._procs.get(task_id)
+            # 单进程：置取消标志即可，引擎通过 cancel_cb 在检查点抛 DownloadCancelled
+            # 立即退出（不再 terminate/kill 进程）；_run_inner 捕获后置 cancelled。
             task["cancel_requested"] = True
             self.store.persist()
-            if proc is not None and proc.poll() is None:
-                # 直接终止下载子进程（Windows 下 terminate 即 TerminateProcess）
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
-                try:
-                    proc.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
-                self.store.update(task, status="cancelled", error="已取消",
-                                  finished_at=now_str(), speed_kbps=0)
-                return True
-            # 无对应下载子进程（如磁盘恢复残留的 running 幽灵状态）：直接置为已取消
-            self.store.update(task, status="cancelled", error="已取消（无运行进程）",
-                              finished_at=now_str(), speed_kbps=0)
             return True
         return False
 
