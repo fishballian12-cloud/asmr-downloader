@@ -28,6 +28,9 @@ createApp({
       detailLoading: false,
       detailError: "",
       // 播放器
+      playerCoverUrl: "",
+      currentTrackName: "", // 当前曲名（独立缓存，不依赖 detail，跨视图保持）
+      currentWorkTitle: "", // 当前作品标题（独立缓存，返回作品库后仍显示正确标题）
       currentAudio: "",
       audioIndex: -1,
       audioPlaying: false,
@@ -148,10 +151,12 @@ createApp({
     volume(v) {
       const el = this.$refs.playerAudio;
       if (el) el.volume = v;
+      try { localStorage.setItem("asmr-volume", String(v)); } catch (e) {}
     },
     muted(v) {
       const el = this.$refs.playerAudio;
       if (el) el.muted = v;
+      try { localStorage.setItem("asmr-muted", v ? "1" : "0"); } catch (e) {}
     },
   },
   methods: {
@@ -394,13 +399,20 @@ createApp({
       this.audioPlaying = false;
       this.currentTime = 0;
       this.duration = 0;
+      this.currentTrackName = "";
+      this.currentWorkTitle = "";
       this.playerCollapsed = false;
       this.playlistOpen = false;
       this.imageIndex = -1;
+      // 播放器封面独立保存：先从作品库摘要预取，避免切换作品/返回库时封面丢失
+      const cached = this.works.find((w) => w.rj === rj);
+      this.playerCoverUrl = (cached && cached.cover_url) || "";
+      if (cached && cached.title) this.currentWorkTitle = cached.title;
       try {
         const d = await this.api(`/api/work/${encodeURIComponent(rj)}`);
         if (seq !== this.detailReqSeq) return;
         this.detail = d;
+        if (d.cover_url) this.playerCoverUrl = d.cover_url;
       } catch (e) {
         if (seq !== this.detailReqSeq) return;
         this.detailError = e.message;
@@ -447,6 +459,13 @@ createApp({
     // ---- 播放器 ----
     playAudio(f, index) {
       if (!f) return;
+      // 曲名/作品标题独立缓存：即使 detail 被清空（返回作品库），播放器仍显示正确文本
+      this.currentTrackName = f.rel || f.name || "";
+      if (this.detail && this.detail.title) this.currentWorkTitle = this.detail.title;
+      // 封面兜底：若尚未记录封面且详情可用，则补记
+      if (!this.playerCoverUrl && this.detail && this.detail.cover_url) {
+        this.playerCoverUrl = this.detail.cover_url;
+      }
       this.audioIndex = index;
       this.audioError = false;
       this.currentTime = 0;
@@ -456,7 +475,11 @@ createApp({
       this.playlistOpen = false;
       this.$nextTick(() => {
         const el = this.$refs.playerAudio;
-        if (el) el.play().catch(() => {});
+        if (el) {
+          el.muted = this.muted;
+          el.volume = this.muted ? 0 : this.volume;
+          el.play().catch(() => {});
+        }
       });
     },
     toggleTrack(f, i) {
@@ -707,6 +730,15 @@ createApp({
   mounted() {
     this._toastId = 0;
     this.applyTheme();
+    // 读取持久化的音量/静音状态
+    try {
+      const savedVol = localStorage.getItem("asmr-volume");
+      if (savedVol !== null && isFinite(Number(savedVol))) {
+        this.volume = Math.min(1, Math.max(0, Number(savedVol)));
+      }
+      const savedMuted = localStorage.getItem("asmr-muted");
+      if (savedMuted !== null) this.muted = savedMuted === "1";
+    } catch (e) {}
     this._themeMq = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
     this._onThemeChange = () => { if (this.themeMode === "system") this.applyTheme(); };
     if (this._themeMq && this._themeMq.addEventListener) this._themeMq.addEventListener("change", this._onThemeChange);

@@ -273,10 +273,10 @@
     <!-- 悬浮播放器：迷你折叠态 -->
     <div v-if="currentAudio && playerCollapsed" class="player-mini" @click="playerCollapsed = false" role="button" aria-label="展开播放器">
       <div class="player-mini-cover">
-        <img v-if="detail && detail.cover_url" :src="detail.cover_url" alt="">
+        <img v-if="playerCoverUrl" :src="playerCoverUrl" alt="">
         <div v-else class="mini-cover-ph">♪</div>
       </div>
-      <span class="player-mini-name">{{ currentAudioName }}</span>
+      <span class="player-mini-name">{{ currentTrackName || currentAudioName }}</span>
       <button class="icon-btn primary-mini" @click.stop="togglePlay" :aria-label="audioPlaying ? '暂停' : '播放'">
         <svg v-if="!audioPlaying" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
         <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M6 19h4V5H6zm8-14v14h4V5z"/></svg>
@@ -290,12 +290,12 @@
       </button>
       <div class="player-top">
         <div class="player-cover">
-          <img v-if="detail && detail.cover_url" :src="detail.cover_url" :alt="detail.title">
+          <img v-if="playerCoverUrl" :src="playerCoverUrl" :alt="detailTitle">
           <div v-else class="cover-placeholder small">无封面</div>
         </div>
         <div class="player-title">
-          <div class="player-work-title" :title="detailTitle">{{ detailTitle }}</div>
-          <div class="player-track-title" :title="currentAudioName">{{ currentAudioName }}</div>
+          <div class="player-work-title" :title="currentWorkTitle || detailTitle">{{ currentWorkTitle || detailTitle }}</div>
+          <div class="player-track-title" :title="currentTrackName || currentAudioName">{{ currentTrackName || currentAudioName }}</div>
         </div>
       </div>
       <div class="player-progress">
