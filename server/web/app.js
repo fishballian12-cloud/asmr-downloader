@@ -224,7 +224,20 @@ createApp({
     },
     async createTasks() {
       if (this.submitting) return;
-      const urls = this.urlsText.split("\n").map((s) => s.trim()).filter(Boolean);
+      let urls = this.urlsText.split("\n").map((s) => s.trim()).filter(Boolean);
+      // 输入区为空时，自动读取剪贴板中的作品链接/RJ 号
+      if (!urls.length && navigator.clipboard && navigator.clipboard.readText) {
+        try {
+          const text = await navigator.clipboard.readText();
+          const parsed = this.parseClipboardText(text);
+          if (parsed.length) {
+            urls = parsed;
+            this.urlsText = parsed.join("\n");
+          }
+        } catch (e) {
+          // 剪贴板读取失败或无权限，保持 urls 为空
+        }
+      }
       if (!urls.length) return;
       const bad = urls.filter((u) => !/^(https?:\/\/\S+|RJ\d{5,})$/i.test(u));
       if (bad.length) {
@@ -244,6 +257,25 @@ createApp({
       } finally {
         this.submitting = false;
       }
+    },
+    parseClipboardText(text) {
+      if (!text) return [];
+      const items = [];
+      const seen = new Set();
+      const reRj = /RJ\s*(\d{5,})/gi;
+      let m;
+      while ((m = reRj.exec(text)) !== null) {
+        const rj = "RJ" + m[1];
+        if (!seen.has(rj)) { seen.add(rj); items.push(rj); }
+      }
+      const reUrl = /https?:\/\/[^\s"'<>]+/gi;
+      while ((m = reUrl.exec(text)) !== null) {
+        const u = m[0].replace(/[),.;，。；）]+$/, "");
+        const uRj = (u.match(/\bRJ\d{5,}/i) || [""])[0].toUpperCase();
+        if (uRj && seen.has(uRj)) continue; // 链接内的 RJ 号已提取，跳过避免重复
+        if (!seen.has(u)) { seen.add(u); items.push(u); }
+      }
+      return items;
     },
     showToast(msg, type = "info") {
       const id = ++this._toastId;
