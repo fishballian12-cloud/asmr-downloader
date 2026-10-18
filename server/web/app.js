@@ -4,7 +4,7 @@ const { createApp } = Vue;
 createApp({
   data() {
     return {
-      view: "tasks",
+      view: (() => { try { return localStorage.getItem("asmr_view") === "library" ? "library" : "tasks"; } catch (e) { return "tasks"; } })(),
       themeMode: "system", // light | dark | system
       urlsText: "",
       options: {
@@ -372,6 +372,7 @@ createApp({
     },
     async switchView(v) {
       this.view = v;
+      try { localStorage.setItem("asmr_view", v); } catch (e) {}
       if (v === "library") await this.loadLibrary();
     },
     async loadLibrary() {

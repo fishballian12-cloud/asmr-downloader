@@ -130,7 +130,7 @@
               <option value="duration">时长</option>
             </select>
           </div>
-          <button class="btn light" @click="loadLibrary" :disabled="libraryLoading">{{ libraryLoading ? '刷新中…' : '刷新' }}</button>
+          <button type="button" class="btn light" @click="loadLibrary" :disabled="libraryLoading">{{ libraryLoading ? '刷新中…' : '刷新' }}</button>
           <span class="lib-count">{{ filteredWorks.length }} 件作品</span>
         </section>
         <div v-if="libraryLoading" class="empty">正在扫描作品库…</div>

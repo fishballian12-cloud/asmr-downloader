@@ -508,3 +508,78 @@ textarea:focus, input:focus, select:focus { border-color: var(--primary); box-sh
 /* 任务卡片标题与状态胶囊分离 */
 .task-card .task-head strong { flex: 1; min-width: 120px; word-break: break-all; }
 .task-card .task-sub { margin: 6px 0 2px; }
+
+/* ===== Kikoeru / asmr.one 观感增强（追加段，后定义覆盖同名规则） ===== */
+/* 作品库网格：桌面 4 列（对齐 asmr.one 列表页） */
+.work-grid { grid-template-columns: repeat(4, 1fr); gap: 16px; }
+@media (max-width: 1024px) {
+  .work-grid { grid-template-columns: repeat(3, 1fr); gap: 14px; }
+}
+@media (max-width: 720px) {
+  .work-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+}
+/* 作品卡片：Kikoeru 8px 圆角 + 常驻轻阴影，hover 抬升 */
+.work-card { border-radius: 8px; box-shadow: 0 1px 3px rgba(21, 101, 192, .10); border: 1px solid var(--border); }
+.work-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-lg); border-color: var(--card-hover-border); }
+:root[data-theme="dark"] .work-card { box-shadow: 0 1px 3px rgba(0, 0, 0, .55); }
+/* 封面比例：竖版 5:7（≈1:1.4，贴近 asmr.one 封面） */
+.work-cover { aspect-ratio: 5 / 7; }
+/* 播放角标：左上角常驻半透明圆形（对齐 asmr.one 封面角标），hover 转主题色 */
+.work-play-hint {
+  position: absolute; top: 8px; left: 8px; right: auto; bottom: auto;
+  width: 34px; height: 34px; border-radius: 50%;
+  background: rgba(0, 0, 0, .38); backdrop-filter: blur(2px);
+  opacity: 1; box-shadow: 0 1px 4px rgba(0, 0, 0, .35);
+}
+.work-play-hint::after { content: "▶"; font-size: 15px; line-height: 34px; }
+.work-card:hover .work-play-hint { background: var(--primary); opacity: 1; }
+/* 信息层级：标题加粗加大、日期/时长行、标签胶囊、社团行 */
+.work-title { font-size: 14px; font-weight: 600; line-height: 1.45; }
+.work-meta-line { font-size: 12px; margin-top: 8px; gap: 7px; }
+.tag { padding: 3px 12px; border-radius: 999px; font-size: 12px; }
+.work-circle { font-size: 12px; }
+.work-rj-badge { padding: 3px 9px; border-radius: 6px; font-size: 11px; }
+/* 工具栏：排序下拉对齐搜索框圆角胶囊 */
+.sort-select { border-radius: 999px; padding: 7px 14px; }
+.lib-count { font-size: 12px; }
+/* 详情页：封面大图 + 信息区排版（对齐 Kikoeru 左封面右信息） */
+.detail-main { align-items: flex-start; }
+.detail-cover { width: 250px; }
+.detail-cover img { border-radius: 8px; box-shadow: 0 4px 16px rgba(21, 101, 192, .16); }
+.detail-meta h2 { font-size: 21px; font-weight: 700; line-height: 1.4; }
+.detail-row b {
+  display: inline-block; background: var(--surface-2); color: var(--text-2);
+  padding: 1px 9px; border-radius: 6px; font-weight: 500; margin-right: 6px;
+}
+.detail-tags .tag { margin: 3px 4px 0 0; }
+/* 音轨列表：当前播放行青色高亮（Kikoeru bg-teal #26A69A） */
+.track-row.active { background: #26a69a; }
+.track-row.active .track-play { background: #26a69a; }
+:root[data-theme="dark"] .track-row.active { background: #20857c; }
+:root[data-theme="dark"] .track-row.active .track-play { background: #26a69a; }
+/* 播放器：青色强调 + 悬浮卡片细节 */
+.player-card { width: 340px; border-radius: 12px; border: 1px solid var(--border); }
+.icon-btn.play-btn { background: var(--accent); }
+.icon-btn.play-btn:hover { background: var(--primary); }
+.progress-range::-webkit-slider-thumb { background: var(--accent); }
+.progress-range::-moz-range-thumb { background: var(--accent); }
+.volume-range::-webkit-slider-thumb { background: var(--accent); }
+.volume-range::-moz-range-thumb { background: var(--accent); }
+.icon-btn.mode-btn.active { background: var(--accent-bg); color: var(--accent-text); }
+.player-cover { border-radius: 8px; }
+.player-fold { background: var(--card-2); color: var(--text-3); }
+.player-fold:hover { background: var(--surface); color: var(--text); }
+.player-top { padding: 10px 12px 8px; }
+/* 进度/音量滑块统一青色强调（完整选择器列表覆盖原始组合规则） */
+.player-range::-webkit-slider-thumb, .progress-range::-webkit-slider-thumb, .player-volume-range::-webkit-slider-thumb, .volume-range::-webkit-slider-thumb {
+  background: var(--accent); border-color: #ffffff;
+}
+.player-range::-moz-range-thumb, .progress-range::-moz-range-thumb, .player-volume-range::-moz-range-thumb, .volume-range::-moz-range-thumb {
+  background: var(--accent);
+}
+:root[data-theme="dark"] .player-range::-webkit-slider-thumb, :root[data-theme="dark"] .progress-range::-webkit-slider-thumb, :root[data-theme="dark"] .player-volume-range::-webkit-slider-thumb, :root[data-theme="dark"] .volume-range::-webkit-slider-thumb {
+  background: var(--accent);
+}
+:root[data-theme="dark"] .player-range::-moz-range-thumb, :root[data-theme="dark"] .progress-range::-moz-range-thumb, :root[data-theme="dark"] .player-volume-range::-moz-range-thumb, :root[data-theme="dark"] .volume-range::-moz-range-thumb {
+  background: var(--accent);
+}
